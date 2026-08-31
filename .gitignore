@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# 快取資料庫與產出（可由 run.py 重新產生）
+data/
+index.html
+
+# 視覺化 brainstorm 伺服器工作目錄
+.superpowers/
