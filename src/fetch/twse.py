@@ -5,6 +5,9 @@
 """
 from __future__ import annotations
 
+from datetime import date as _date
+from datetime import timedelta
+
 from src import constants as C
 from src.http import fetch_json
 from src.parsing import parse_num
@@ -53,6 +56,19 @@ def roc_to_iso(value: str | None) -> str | None:
         return None
     year = int(text[:3]) + 1911
     return f"{year:04d}-{text[3:5]}-{text[5:7]}"
+
+
+def gregorian_to_iso(value: str | None) -> str | None:
+    """8 碼西元日期 -> ISO。"19620209" -> "1962-02-09"。
+
+    t187ap03_L 在同一份 payload 內混用兩種格式：
+    「出表日期」是 7 碼民國，「成立日期」「上市日期」是 8 碼西元。
+    用錯解析器會靜默得到 None，故兩者分開實作且互不接受對方的長度。
+    """
+    text = (value or "").strip()
+    if len(text) != 8 or not text.isdigit():
+        return None
+    return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
 
 
 def _roc_ym_to_iso(value: str | None) -> str | None:
@@ -107,6 +123,79 @@ def fetch_margin(session, limiter=None) -> list[dict]:
             "margin_balance_prev": parse_num(row[C.MARGIN_BALANCE_PREV], int),
             "short_balance": parse_num(row[C.SHORT_BALANCE_TODAY], int),
             "short_balance_prev": parse_num(row[C.SHORT_BALANCE_PREV], int),
+        }
+        for row in raw
+    ]
+
+
+T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"
+
+# T86 回傳 fields/data 二維陣列。欄位以名稱定位，不寫死索引 ——
+# 欄位順序若調整，寫死索引會靜默取到錯的數字。
+INSTI_CODE_FIELD = "證券代號"
+INSTI_FOREIGN_FIELD = "外陸資買賣超股數(不含外資自營商)"
+INSTI_TRUST_FIELD = "投信買賣超股數"
+INSTI_DEALER_FIELD = "自營商買賣超股數"
+
+
+def fetch_institutional(
+    session, date: str, limiter=None, lookback_days: int = 7
+) -> list[dict]:
+    """上市三大法人買賣超。
+
+    TWSE 於收盤後才發布當日 T86，盤中查當日會得到
+    「很抱歉，沒有符合條件的資料!」。若不往回找，交易日盤中執行就會
+    完全拿不到籌碼資料。因此自當日起往回尋找最近一個有資料的交易日，
+    並在每列標註實際資料日期 —— 不得謊報成執行當天。
+    """
+    start = _date.fromisoformat(date)
+    payload = None
+    actual = None
+    for offset in range(lookback_days + 1):
+        probe = (start - timedelta(days=offset)).isoformat()
+        candidate = fetch_json(
+            session,
+            T86_URL,
+            params={"date": probe.replace("-", ""), "selectType": "ALL",
+                    "response": "json"},
+            limiter=limiter,
+        )
+        if str(candidate.get("stat", "")).upper() == "OK":
+            payload, actual = candidate, probe
+            break
+    if payload is None:
+        return []
+
+    fields = payload.get("fields") or []
+    try:
+        i_code = fields.index(INSTI_CODE_FIELD)
+        i_foreign = fields.index(INSTI_FOREIGN_FIELD)
+        i_trust = fields.index(INSTI_TRUST_FIELD)
+        i_dealer = fields.index(INSTI_DEALER_FIELD)
+    except ValueError as exc:
+        raise RuntimeError(f"T86 欄位結構改變：{exc}") from exc
+
+    return [
+        {
+            "code": (row[i_code] or "").strip(),
+            "date": actual,
+            "foreign_net": parse_num(row[i_foreign], int),
+            "trust_net": parse_num(row[i_trust], int),
+            "dealer_net": parse_num(row[i_dealer], int),
+        }
+        for row in payload.get("data") or []
+    ]
+
+
+def fetch_company_profiles(session, limiter=None) -> list[dict]:
+    """上市公司基本資料。產業別在此為代碼（如 "24"），對照見 src/industry.py。"""
+    raw = fetch_json(session, f"{BASE}/opendata/t187ap03_L", limiter=limiter)
+    return [
+        {
+            "code": row[C.PROFILE_CODE],
+            "short_name": row.get(C.PROFILE_SHORT_NAME),
+            "industry_code": (row.get(C.PROFILE_INDUSTRY) or "").strip() or None,
+            "listed_date": gregorian_to_iso(row.get("上市日期")),
         }
         for row in raw
     ]

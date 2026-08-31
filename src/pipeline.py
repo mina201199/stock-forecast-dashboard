@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import config
-from src import store
+from src import industry, store
 from src.dates import market_date, utc_now_iso
 from src.fetch import news, tdcc, tpex, twse, universe, yahoo
 from src.http import fetch_text
@@ -54,26 +54,45 @@ def fetch_all(
         sp500 = []
     us_picks = universe.select_us(sp500, us_limit)
 
-    store.upsert(conn, "stocks", [
-        {"symbol": p["symbol"], "market": p["market"], "code": p["code"],
-         "name": p.get("name"), "name_en": p.get("name") if p["market"] == "US" else None,
-         "sector": p.get("sector"), "industry": None,
-         "currency": "TWD" if p["market"] == "TW" else "USD",
-         "listed_date": None, "updated_at": utc_now_iso()}
-        for p in tw_picks + us_picks
-    ])
-    stats["universe"] = len(tw_picks) + len(us_picks)
-
     # --- 台股全市場批次（不逐檔請求，spec 4）---
-    log("抓取台股估值／營收／除權息／融資融券／大戶持股…")
+    log("抓取台股估值／營收／產業／除權息／融資融券／籌碼…")
     valuation = _index(_safe("twse.valuation", stats, log, twse.fetch_valuation, session))
-    revenue = _index(_safe("twse.revenue", stats, log, twse.fetch_monthly_revenue, session))
+    revenue_rows = _safe("twse.revenue", stats, log, twse.fetch_monthly_revenue, session)
+    revenue = _index(revenue_rows)
     exright = _index(_safe("twse.exright", stats, log, twse.fetch_exright, session))
     margin = _index(_safe("twse.margin", stats, log, twse.fetch_margin, session))
     holders = _index(_safe("tdcc.holders", stats, log, tdcc.fetch_big_holders, session))
+
+    # 三大法人：上市走 T86、上櫃走 TPEx，兩份合併
     institutional = _index(
-        _safe("tpex.institutional", stats, log, tpex.fetch_institutional, session)
+        _safe("twse.institutional", stats, log, twse.fetch_institutional, session, tw_today)
     )
+    institutional.update(
+        _index(_safe("tpex.institutional", stats, log, tpex.fetch_institutional, session))
+    )
+
+    # 產業分類：上市月營收直接給中文；上櫃只給代碼，靠上市資料推導對照表
+    twse_profiles = _safe("twse.profiles", stats, log, twse.fetch_company_profiles, session)
+    tpex_profiles = _safe("tpex.profiles", stats, log, tpex.fetch_company_profiles, session)
+    code_map = industry.build_code_map(twse_profiles, revenue_rows)
+    profiles = _index(twse_profiles)
+    profiles.update(_index(tpex_profiles))
+
+    store.upsert(conn, "stocks", [
+        {"symbol": p["symbol"], "market": p["market"], "code": p["code"],
+         "name": p.get("name"), "name_en": p.get("name") if p["market"] == "US" else None,
+         "sector": p.get("sector") if p["market"] == "US" else industry.resolve(
+             (revenue.get(p["code"]) or {}).get("industry"),
+             (profiles.get(p["code"]) or {}).get("industry_code"), code_map),
+         "industry": p.get("sector") if p["market"] == "US" else industry.resolve(
+             (revenue.get(p["code"]) or {}).get("industry"),
+             (profiles.get(p["code"]) or {}).get("industry_code"), code_map),
+         "currency": "TWD" if p["market"] == "TW" else "USD",
+         "listed_date": (profiles.get(p["code"]) or {}).get("listed_date"),
+         "updated_at": utc_now_iso()}
+        for p in tw_picks + us_picks
+    ])
+    stats["universe"] = len(tw_picks) + len(us_picks)
 
     tw_fundamentals, tw_dividends, tw_margin, tw_holders, tw_insti = [], [], [], [], []
     for pick in tw_picks:
@@ -112,7 +131,8 @@ def fetch_all(
         if code in institutional:
             i = institutional[code]
             tw_insti.append({
-                "symbol": symbol, "date": tw_today,
+                # 用來源標註的實際資料日；T86 盤中查不到當日，會回退到前一交易日
+                "symbol": symbol, "date": i.get("date") or tw_today,
                 "foreign_net": i.get("foreign_net"), "trust_net": i.get("trust_net"),
                 "dealer_net": i.get("dealer_net")})
 
@@ -129,6 +149,15 @@ def fetch_all(
         try:
             rows = yahoo.fetch_chart(session, symbol, range_=f"{config.HISTORY_YEARS}y")
             store.upsert(conn, "prices", rows)
+            # 歷史除息：TWSE 的除權息表只含未來 14 天，歷史配息要從 Yahoo 的
+            # events 取得，否則 dividends 表對多數個股會是空的。
+            events = yahoo.fetch_dividend_events(session, symbol)
+            store.upsert(conn, "dividends", [
+                {"symbol": e["symbol"], "ex_date": e["ex_date"], "type": "息",
+                 "cash_dividend": e["cash_dividend"], "stock_dividend": None,
+                 "pay_date": None}
+                for e in events
+            ])
         except Exception as exc:  # 單檔失敗不得中斷整體（spec 9.1）
             stats["failed"].append(symbol)
             log(f"  x {symbol} 日線失敗：{exc}")

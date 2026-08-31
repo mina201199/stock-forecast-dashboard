@@ -88,3 +88,17 @@ def test_difference_fields_unaffected_by_collision(patched):
     row = tpex.fetch_institutional(session=None)[0]
     assert row["dealer_net"] == -8000
     assert row["foreign_net"] == 171000
+
+
+def test_company_profiles_expose_industry_code_and_listing_date(monkeypatch):
+    """上櫃只給產業代碼，中文名稱需靠 src/industry.py 的對照表。"""
+    monkeypatch.setattr(tpex, "fetch_json", lambda *a, **k: [{
+        "Date": "1150830", "SecuritiesCompanyCode": "6488",
+        "CompanyName": "環球晶圓股份有限公司", "CompanyAbbreviation": "環球晶",
+        "SecuritiesIndustryCode": "24", "DateOfListing": "1040819",
+    }])
+    row = tpex.fetch_company_profiles(session=None)[0]
+    assert row["code"] == "6488"
+    assert row["short_name"] == "環球晶"
+    assert row["industry_code"] == "24"
+    assert row["listed_date"] == "2015-08-19"

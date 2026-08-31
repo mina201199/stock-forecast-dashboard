@@ -30,6 +30,15 @@ def stubs(monkeypatch):
         {"code": "2330", "margin_balance": 45250, "margin_balance_prev": 45000,
          "short_balance": 1210, "short_balance_prev": 1200}])
     monkeypatch.setattr(pipeline.tpex, "fetch_institutional", lambda *a, **k: [])
+    monkeypatch.setattr(pipeline.twse, "fetch_institutional", lambda *a, **k: [
+        {"code": "2330", "date": "2026-08-28", "foreign_net": 18_000_000,
+         "trust_net": 4_000_000, "dealer_net": -500_000}])
+    monkeypatch.setattr(pipeline.twse, "fetch_company_profiles", lambda *a, **k: [
+        {"code": "2330", "short_name": "台積電", "industry_code": "24",
+         "listed_date": "1994-09-05"}])
+    monkeypatch.setattr(pipeline.tpex, "fetch_company_profiles", lambda *a, **k: [])
+    monkeypatch.setattr(pipeline.yahoo, "fetch_dividend_events", lambda session, symbol, **k: [
+        {"symbol": symbol, "ex_date": "2026-06-11", "cash_dividend": 6.0}])
     monkeypatch.setattr(pipeline.tdcc, "fetch_big_holders", lambda *a, **k: [
         {"code": "2330", "date": "2026-08-28", "big_holder_pct": 71.34}])
     monkeypatch.setattr(pipeline.universe, "parse_sp500", lambda html: [
@@ -70,8 +79,10 @@ def test_fetch_all_writes_prices_with_adjclose(conn, stubs):
 
 def test_fetch_all_writes_dividends_and_margin(conn, stubs):
     _run(conn)
-    div = conn.execute("SELECT * FROM dividends WHERE symbol='2330.TW'").fetchone()
-    assert div["ex_date"] == "2026-09-11" and div["cash_dividend"] == 6.0
+    dates = [r["ex_date"] for r in
+             conn.execute("SELECT ex_date FROM dividends WHERE symbol='2330.TW' ORDER BY ex_date")]
+    # 未來除權息來自 TWSE 預告表，歷史配息來自 Yahoo events —— 兩者都要有
+    assert dates == ["2026-06-11", "2026-09-11"]
     mgn = conn.execute("SELECT * FROM margin WHERE symbol='2330.TW'").fetchone()
     assert mgn["margin_balance"] == 45250
 
@@ -126,3 +137,30 @@ def test_batch_source_failure_does_not_abort_run(conn, stubs, monkeypatch):
     stats = _run(conn)
     assert conn.execute("SELECT COUNT(*) c FROM stocks").fetchone()["c"] == 2
     assert any("holders" in s for s in stats["degraded"])
+
+
+def test_taiwan_industry_is_populated_from_revenue_text(conn, stubs):
+    """使用者明確要求的產業分類欄位不得為空。"""
+    _run(conn)
+    row = conn.execute("SELECT sector, industry FROM stocks WHERE symbol='2330.TW'").fetchone()
+    assert row["sector"] == "半導體業"
+    assert row["industry"] == "半導體業"
+
+
+def test_listed_date_recorded_for_new_listing_filter(conn, stubs):
+    """spec 7.5：上市未滿 120 日不預測，需要上市日期才能判斷。"""
+    _run(conn)
+    row = conn.execute("SELECT listed_date FROM stocks WHERE symbol='2330.TW'").fetchone()
+    assert row["listed_date"] == "1994-09-05"
+
+
+def test_listed_institutional_flows_are_written(conn, stubs):
+    """上市三大法人走 T86；先前只做上櫃，導致這張表全空。"""
+    _run(conn)
+    row = conn.execute("SELECT * FROM institutional WHERE symbol='2330.TW'").fetchone()
+    assert row is not None
+    assert row["foreign_net"] == 18_000_000
+    assert row["trust_net"] == 4_000_000
+    assert row["dealer_net"] == -500_000
+    # 標註的是來源實際資料日，不是執行當天
+    assert row["date"] == "2026-08-28"
