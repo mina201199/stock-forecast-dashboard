@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+<title>台積電 - Google News</title>
+<item>
+  <title>法人上調台積電目標價至 2800 元</title>
+  <link>https://news.example.com/a1</link>
+  <pubDate>Sun, 30 Aug 2026 09:12:00 GMT</pubDate>
+  <source url="https://news.example.com">經濟日報</source>
+</item>
+<item>
+  <title>先進封裝產能滿載至明年</title>
+  <link>https://news.example.com/a2</link>
+  <pubDate>Sat, 29 Aug 2026 01:00:00 GMT</pubDate>
+  <source url="https://news.example.com">工商時報</source>
+</item>
+</channel></rss>
