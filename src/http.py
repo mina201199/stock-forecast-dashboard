@@ -90,3 +90,60 @@ def fetch_text(
     if encoding is not None:
         response.encoding = encoding
     return response.text
+
+
+class YahooClient:
+    """Yahoo Finance 存取。
+
+    quoteSummary 需要 cookie + crumb 握手（spec 2.4）：
+      1. GET fc.yahoo.com          -> 回 404，但 cookie 會種下，不得視為失敗
+      2. GET v1/test/getcrumb      -> 取得 crumb
+      3. quoteSummary 附加 &crumb=
+    v7/finance/quote 已全面封鎖，不使用。
+    """
+
+    COOKIE_URL = "https://fc.yahoo.com"
+    CRUMB_URL = "https://query1.finance.yahoo.com/v1/test/getcrumb"
+    SUMMARY_URL = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
+
+    def __init__(self, session: requests.Session, limiter: RateLimiter | None = None) -> None:
+        self._session = session
+        self._limiter = limiter
+        self._crumb: str | None = None
+
+    def _handshake(self) -> str:
+        try:
+            self._session.get(self.COOKIE_URL, timeout=20)
+        except requests.RequestException:
+            # cookie 端點不穩定；即使連線失敗也先試著取 crumb
+            pass
+        response = self._session.get(self.CRUMB_URL, timeout=20)
+        response.raise_for_status()
+        crumb = response.text.strip()
+        if not crumb or "<" in crumb:
+            raise RuntimeError(f"Yahoo crumb 取得失敗：{crumb[:60]!r}")
+        self._crumb = crumb
+        return crumb
+
+    def crumb(self) -> str:
+        return self._crumb or self._handshake()
+
+    def quote_summary(self, symbol: str, modules: list[str]) -> dict:
+        for attempt in (1, 2):
+            if self._limiter is not None:
+                self._limiter.wait()
+            response = self._session.get(
+                self.SUMMARY_URL.format(symbol=symbol),
+                params={"modules": ",".join(modules), "crumb": self.crumb()},
+                timeout=config.HTTP_TIMEOUT,
+            )
+            if response.status_code == 401 and attempt == 1:
+                self._crumb = None  # crumb 過期 -> 重新握手一次（spec 9.2）
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            results = (payload.get("quoteSummary") or {}).get("result") or []
+            if not results:
+                raise RuntimeError(f"{symbol} quoteSummary 無結果")
+            return results[0]
+        raise RuntimeError(f"{symbol} quoteSummary 重新握手後仍失敗")
