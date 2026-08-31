@@ -66,9 +66,14 @@ def _run(conn):
 
 
 def test_fetch_all_populates_stocks_for_both_markets(conn, stubs):
+    import config
     _run(conn)
-    rows = conn.execute("SELECT symbol, market FROM stocks ORDER BY symbol").fetchall()
-    assert [(r["symbol"], r["market"]) for r in rows] == [("2330.TW", "TW"), ("AAPL", "US")]
+    rows = {r["symbol"]: r["market"] for r in
+            conn.execute("SELECT symbol, market FROM stocks")}
+    assert rows["2330.TW"] == "TW"
+    assert rows["AAPL"] == "US"
+    # 基準另外註冊，不屬於選股池
+    assert set(rows) == {"2330.TW", "AAPL", config.TW_BENCHMARK, config.US_BENCHMARK}
 
 
 def test_fetch_all_writes_prices_with_adjclose(conn, stubs):
@@ -135,7 +140,9 @@ def test_batch_source_failure_does_not_abort_run(conn, stubs, monkeypatch):
 
     monkeypatch.setattr(pipeline.tdcc, "fetch_big_holders", boom)
     stats = _run(conn)
-    assert conn.execute("SELECT COUNT(*) c FROM stocks").fetchone()["c"] == 2
+    # 2 檔選股池 + 2 檔基準
+    assert conn.execute("SELECT COUNT(*) c FROM stocks").fetchone()["c"] == 4
+    assert stats["universe"] == 2  # universe 只計選股池
     assert any("holders" in s for s in stats["degraded"])
 
 
@@ -164,3 +171,22 @@ def test_listed_institutional_flows_are_written(conn, stubs):
     assert row["dealer_net"] == -500_000
     # 標註的是來源實際資料日，不是執行當天
     assert row["date"] == "2026-08-28"
+
+
+def test_benchmark_symbols_are_always_fetched(conn, stubs):
+    """spec 6.1：超額報酬標籤需要基準的價格序列，選股池不含它們，
+    因此必須額外抓取，否則模型完全無法訓練。
+    """
+    import config
+    _run(conn)
+    symbols = {r["symbol"] for r in conn.execute("SELECT symbol FROM prices")}
+    assert config.TW_BENCHMARK in symbols
+    assert config.US_BENCHMARK in symbols
+
+
+def test_benchmarks_are_registered_in_stocks_table(conn, stubs):
+    import config
+    _run(conn)
+    rows = {r["symbol"]: r["name"] for r in conn.execute("SELECT symbol, name FROM stocks")}
+    assert config.TW_BENCHMARK in rows
+    assert "基準" in rows[config.TW_BENCHMARK]

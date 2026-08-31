@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>股勢 — 台股／美股統計分析</title>
+<style>{{ style | safe }}</style>
+</head>
+<body>
+
+<div class="disclaimer">⚠ {{ disclaimer }}</div>
+
+<header class="top">
+  <div class="top-inner">
+    <div class="brand">📈 股<span>勢</span></div>
+    <div class="search-box">
+      <input id="search" type="search" autocomplete="off"
+             placeholder="搜尋代號、中文名、英文名或產業（例：2330、台積、TSMC、半導體）">
+    </div>
+    <button class="pill on" data-market="ALL">全部</button>
+    <button class="pill" data-market="TW">台股</button>
+    <button class="pill" data-market="US">美股</button>
+  </div>
+  <div class="meta-line">
+    資料產生於 {{ generated_at }}　｜　共 {{ stock_count }} 檔　｜　預測期間 {{ horizon_days }} 個交易日
+    {% if report.trained %}
+      　｜　模型測試集 IC {{ '%.3f'|format(report.ic) if report.ic is not none else '—' }}
+      {% if report.momentum_ic is not none %}
+        （動能基準 {{ '%.3f'|format(report.momentum_ic) }}）
+      {% endif %}
+    {% else %}
+      　｜　<span style="color:var(--warn)">技術面模型未訓練：{{ report.reason }}</span>
+    {% endif %}
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="home">
+    <div class="boards" id="boards"></div>
+
+    <div class="filters">
+      <label for="f-industry">產業</label>
+      <select id="f-industry"><option value="ALL">全部</option></select>
+
+      <label for="f-trend">趨勢</label>
+      <select id="f-trend">
+        <option value="ALL">全部</option>
+        <option value="breakout">強勢突破</option>
+        <option value="uptrend">穩步上升</option>
+        <option value="range">區間整理</option>
+        <option value="weakening">轉弱</option>
+        <option value="basing">弱勢築底</option>
+      </select>
+
+      <label for="f-conf">信心度 ≥ <span id="f-conf-val">0</span></label>
+      <input id="f-conf" type="range" min="0" max="100" step="5" value="0">
+
+      <span class="count" id="count"></span>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead id="thead"></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+
+    {% if report.trained %}
+    <div class="grid" style="margin-top:14px">
+      <div class="card wide">
+        <h4>模型驗證（測試集，走前切分並 purge {{ horizon_days }} 個交易日）</h4>
+        <div class="kv"><span class="k">訓練樣本數</span><span class="v">{{ '{:,}'.format(report.n_samples) }}</span></div>
+        <div class="kv"><span class="k">測試集 IC（Spearman）</span><span class="v">{{ '%.4f'|format(report.ic) if report.ic is not none else '—' }}</span></div>
+        <div class="kv"><span class="k">動能基準 IC</span><span class="v">{{ '%.4f'|format(report.momentum_ic) if report.momentum_ic is not none else '—' }}</span></div>
+        {% if report.quintile_returns %}
+        <div class="kv"><span class="k">預測分五組的實際平均超額報酬</span>
+          <span class="v">{% for q in report.quintile_returns %}{{ '%+.2f%%'|format(q * 100) }}{% if not loop.last %} → {% endif %}{% endfor %}</span></div>
+        {% endif %}
+        {% if report.ic is not none and report.momentum_ic is not none and report.ic <= report.momentum_ic %}
+        <div class="alert">
+          ⚠ 模型的測試集 IC 並未勝過「純 20 日動能」這個簡單基準。
+          這代表在目前的資料量與特徵下，模型沒有展現出顯著的附加價值。
+          此處據實呈現，不做美化 —— 請據此下調對預測值的信任程度。
+        </div>
+        {% endif %}
+        <div class="faint" style="font-size:11px;margin-top:8px">
+          IC 為預測值與實際超額報酬的秩相關係數。橫斷面選股中 IC 達 0.03–0.05 已屬可用，
+          但必須勝過簡單基準才代表模型本身有貢獻。分組報酬若呈單調遞增，表示排序能力有效。
+        </div>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="detail" id="detail"></div>
+
+  <footer class="foot">
+    <strong>資料來源</strong>：臺灣證券交易所（TWSE OpenAPI、三大法人 T86、融資融券、除權息預告）、
+    證券櫃檯買賣中心（TPEx OpenAPI）、臺灣集中保管結算所（股權分散表）、
+    Yahoo Finance（日線還原價、美股基本面與分析師目標價）、Google News RSS。<br>
+
+    <strong>方法</strong>：技術面為 LightGBM 分位數迴歸，標籤是相對於
+    0050.TW／SPY 的未來 {{ horizon_days }} 日<em>超額</em>報酬（非絕對報酬）；
+    時序切分並在訓練集尾端 purge {{ horizon_days }} 個交易日以避免資料洩漏。
+    基本面為同業相對估值，EPS ≤ 0 時自動由 PE 法切換為 PB 法。
+    新聞情緒為財經詞典比對（中文自建詞表 + Loughran-McDonald 英文金融詞典），非語意理解。<br>
+
+    <strong>已知限制</strong>：技術面軌道換算價格時假設大盤同期持平（大盤走勢無法預測）；
+    台股沒有免費的分析師前瞻 EPS，估值品質弱於美股；美股即時報價有約 15 分鐘延遲；
+    本頁為靜態產出，價格為產生當下的收盤快照。<br>
+
+    <strong>{{ disclaimer }}</strong>
+  </footer>
+</div>
+
+<script id="payload" type="application/json">{{ data_json | safe }}</script>
+<script>{{ script | safe }}</script>
+</body>
+</html>

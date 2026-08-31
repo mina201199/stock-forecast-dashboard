@@ -8,7 +8,7 @@ import argparse
 import sys
 
 import config
-from src import store
+from src import analysis, render, store
 from src.http import RateLimiter, YahooClient, make_session
 from src.pipeline import fetch_all
 
@@ -31,35 +31,61 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    for flag, name in (("serve", "--serve"), ("backtest", "--backtest")):
-        if getattr(args, flag):
-            print(_NOT_YET.format(name=name), file=sys.stderr)
-            return 2
+    if args.serve:
+        print(_NOT_YET.format(name="--serve"), file=sys.stderr)
+        return 2
 
     conn = store.connect(config.DB_PATH)
     store.init_schema(conn)
     try:
-        if args.no_fetch:
-            print(_NOT_YET.format(name="--no-fetch"), file=sys.stderr)
-            return 2
+        if not args.no_fetch:
+            session = make_session()
+            client = YahooClient(session, RateLimiter(config.YAHOO_MIN_INTERVAL))
+            stats = fetch_all(
+                conn,
+                session,
+                tw_limit=args.tw,
+                us_limit=args.us,
+                yahoo_client=client,
+                progress=lambda m: print(m, flush=True),
+            )
+            print(
+                f"抓取完成：選股池 {stats['universe']} 檔"
+                f"｜個股失敗 {len(stats['failed'])}"
+                f"｜降級來源 {len(stats['degraded'])}"
+            )
+            for line in stats["degraded"]:
+                print(f"  降級：{line}")
 
-        session = make_session()
-        client = YahooClient(session, RateLimiter(config.YAHOO_MIN_INTERVAL))
-        stats = fetch_all(
-            conn,
-            session,
-            tw_limit=args.tw,
-            us_limit=args.us,
-            yahoo_client=client,
-            progress=lambda m: print(m, flush=True),
+        if args.fetch_only:
+            return 0
+
+        print("計算特徵、訓練模型、合成目標價…", flush=True)
+        payload = analysis.analyse(conn)
+        if not payload["stocks"]:
+            print("資料庫沒有可分析的個股。先執行一次抓取。", file=sys.stderr)
+            return 1
+
+        report = payload["report"]
+        if report["trained"]:
+            ic = report.get("ic")
+            momentum = report.get("momentum_ic")
+            print(f"模型已訓練：樣本 {report['n_samples']:,} 筆"
+                  f"｜測試集 IC {ic:.4f}" if ic is not None else "模型已訓練")
+            if ic is not None and momentum is not None:
+                verdict = "勝過" if ic > momentum else "未勝過"
+                print(f"  對照動能基準 IC {momentum:.4f} -> {verdict}基準")
+        else:
+            print(f"技術面模型未訓練：{report['reason']}")
+
+        target = render.write_html(payload)
+        size_mb = target.stat().st_size / 1024 / 1024
+        predictable = sum(
+            1 for s in payload["stocks"] if s["prediction"].get("predictable")
         )
-        print(
-            f"完成：選股池 {stats['universe']} 檔"
-            f"｜個股失敗 {len(stats['failed'])}"
-            f"｜降級來源 {len(stats['degraded'])}"
-        )
-        for line in stats["degraded"]:
-            print(f"  降級：{line}")
+        print(f"已產生 {target}（{size_mb:.2f} MB）")
+        print(f"  {len(payload['stocks'])} 檔中 {predictable} 檔提供預測值，"
+              f"其餘因資料或訊號品質不足而不給預測")
     finally:
         conn.close()
     return 0

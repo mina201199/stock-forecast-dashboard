@@ -142,9 +142,26 @@ def fetch_all(
     store.upsert(conn, "holders", tw_holders)
     store.upsert(conn, "institutional", tw_insti)
 
+    # --- 基準指數：模型的超額報酬標籤需要它（spec 6.1）---
+    # 用 ETF 而非價格指數，因為個股報酬取自 adjclose（含息），
+    # 與價格指數相減會產生約等於殖利率的系統性偏差。
+    benchmarks = [
+        {"symbol": config.TW_BENCHMARK, "code": config.TW_BENCHMARK.split(".")[0],
+         "market": "TW", "name": "台灣50 ETF（基準）"},
+        {"symbol": config.US_BENCHMARK, "code": config.US_BENCHMARK,
+         "market": "US", "name": "S&P 500 ETF（基準）"},
+    ]
+    store.upsert(conn, "stocks", [
+        {"symbol": b["symbol"], "market": b["market"], "code": b["code"],
+         "name": b["name"], "name_en": None, "sector": None, "industry": None,
+         "currency": "TWD" if b["market"] == "TW" else "USD",
+         "listed_date": None, "updated_at": utc_now_iso()}
+        for b in benchmarks
+    ])
+
     # --- 逐檔：日線（台美股共用）---
-    log(f"抓取 {stats['universe']} 檔日線…")
-    for pick in tw_picks + us_picks:
+    log(f"抓取 {stats['universe']} 檔日線 + 2 檔基準…")
+    for pick in benchmarks + tw_picks + us_picks:
         symbol = pick["symbol"]
         try:
             rows = yahoo.fetch_chart(session, symbol, range_=f"{config.HISTORY_YEARS}y")
