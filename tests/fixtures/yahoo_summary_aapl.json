@@ -1,0 +1,6 @@
+{"summaryDetail":{"trailingPE":{"raw":36.62},"forwardPE":{"raw":33.52},"dividendYield":{"raw":0.0034},"exDividendDate":{"raw":1786320000,"fmt":"2026-08-10"},"payoutRatio":{"raw":0.1204},"beta":{"raw":1.086},"marketCap":{"raw":4665759498240}},
+"defaultKeyStatistics":{"priceToBook":{"raw":43.4375},"shortPercentOfFloat":{"raw":0.008},"heldPercentInstitutions":{"raw":0.66398},"earningsQuarterlyGrowth":{"raw":0.271}},
+"financialData":{"currentPrice":{"raw":319.7},"targetHighPrice":{"raw":400.0},"targetLowPrice":{"raw":215.0},"targetMeanPrice":{"raw":324.45},"recommendationKey":"buy","numberOfAnalystOpinions":{"raw":39},"revenueGrowth":{"raw":0.164},"grossMargins":{"raw":0.468},"operatingMargins":{"raw":0.321},"profitMargins":{"raw":0.27618},"returnOnEquity":{"raw":1.48751},"returnOnAssets":{"raw":0.245},"debtToEquity":{"raw":78.445},"currentRatio":{"raw":0.92},"freeCashflow":{"raw":98000000000}},
+"summaryProfile":{"sector":"Technology","industry":"Consumer Electronics"},
+"calendarEvents":{"earnings":{"earningsDate":[{"raw":1793304000,"fmt":"2026-10-29"}]},"exDividendDate":{"raw":1786320000}},
+"earningsTrend":{"trend":[{"period":"0q","earningsEstimate":{"avg":{"raw":1.97656}}},{"period":"+1y","earningsEstimate":{"avg":{"raw":9.42}}}]}}
