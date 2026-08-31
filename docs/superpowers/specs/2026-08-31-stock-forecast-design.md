@@ -503,8 +503,9 @@ R3 最易犯錯且錯了回測會失真至不可信，須有專屬測試（見 �
 
 | 陷阱 | 處理 |
 |---|---|
-| **台灣交易所 TLS 憑證缺 Subject Key Identifier** | 見 §9.4 —— 原先「改用 `requests` 即可」的結論**經實際執行證明不足**，已修正 |
-| **TPEx 在 Cloudflare 後，會回 520 與截斷回應** | 見 §9.5 |
+| **NaN 穿過所有守衛後被夾取成滿分** | 見 §9.4 —— 本專案最危險的一種錯誤 |
+| **台灣交易所 TLS 憑證缺 Subject Key Identifier** | 見 §9.5 —— 原先「改用 `requests` 即可」的結論**經實際執行證明不足**，已修正 |
+| **TPEx 在 Cloudflare 後，會回 520 與截斷回應** | 見 §9.6 |
 | **TDCC 為 CSV + UTF-8 BOM** | 以 `utf-8-sig` 解碼，非 JSON |
 | **TPEx 三大法人欄位名含不一致空格** | 如 `' Foreign Investors ...-Total Sell'`（前導空格）、`'Dealers -TotalSell'`（中間空格）。讀取前須正規化欄位名（去空格、統一大小寫），否則 KeyError |
 | **Yahoo chart 預設不回 adjclose** | 必須帶 `&events=div,split` |
@@ -516,7 +517,28 @@ R3 最易犯錯且錯了回測會失真至不可信，須有專屬測試（見 �
 | **MIS 需先取 session cookie** | 直接打 `getStockInfo.jsp` 會被拒。須先 GET `mis.twse.com.tw/stock/index.jsp` 建立 session |
 | **免費源皆無 CORS 標頭** | 三個端點實測 `Access-Control-Allow-Origin` 均為 `None`。即時報價必須經 `serve.py` 代理，不可期待瀏覽器直連 |
 
-### 9.4 台灣交易所的 TLS 憑證（修正版）
+### 9.4 NaN 傳播：「沒有資料」被靜默呈現為「滿分信心」
+
+**這是本專案發現過最危險的一種錯誤**，因為它不會拋例外、不會讓測試變紅，只會在頁面上顯示一個看起來最可信的數字。
+
+實跑後檢視頁面時發現 14 檔的信心度是 100，但同一頁攤開的四因子拆解是 100 / 29.7 / 50.4 —— 加權後不可能是 100。追出的傳播鏈：
+
+| Python 表達式 | 結果 | 造成的後果 |
+|---|---|---|
+| `not float("nan")` | `False` | `if not pe` 這類守衛放它過去 |
+| `float("nan") <= 0` | `False` | 範圍檢查放它過去 |
+| `all([nan, nan])` | `True` | 完整性檢查放它過去 |
+| `max(0.0, min(100.0, nan))` | **`100.0`** | 夾取把它變成上界 |
+
+最後一條是關鍵：`min(100.0, nan)` 因為 `nan < 100.0` 為 False 而回傳 `100.0`。SQLite 的 NULL 經 pandas 成為 NaN，一路穿過所有守衛，最後被夾取成滿分。
+
+**處置**：
+- 新增 `src/numeric.py`。所有數值守衛與夾取一律經過它；`clamp()` 對非有限值回傳 `None`，**絕不回傳上下界**
+- `valuation.py`、`compose.py` 的每個守衛改用 `is_finite()` / `is_positive()`，禁止真值判斷
+- `analysis.py` 在讀取層就把 pandas NaN 轉回 `None`，從源頭斷路徑
+- `tests/test_nan_safety.py` 16 個迴歸測試，**第一個測試先斷言 `max(0.0, min(100.0, nan)) == 100.0`**，證明這個陷阱真的存在，否則後續防護看起來像多餘的
+
+### 9.5 台灣交易所的 TLS 憑證（修正版）
 
 **原先的結論是錯的。** 設計階段以 `requests` 對 `openapi.twse.com.tw` 連測 8 次全數成功，據此寫下「改用 `requests` 即可」。實際執行管線時，`www.tpex.org.tw` 仍以相同錯誤失敗：
 
@@ -538,7 +560,7 @@ www.tpex.org.tw       opendata.tdcc.com.tw
 
 **仍然禁用 `verify=False`** —— 那會關閉全部驗證，與本處置有本質差異。測試 `tests/test_http_tls.py` 同時斷言「旗標已清除」與「驗證性質未被削弱」，並斷言非台灣主機沒有被放寬。
 
-### 9.5 TPEx 的 Cloudflare 行為
+### 9.6 TPEx 的 Cloudflare 行為
 
 TPEx 位於 Cloudflare 之後。連續請求實測 8 次僅 2 次成功，兩種失敗型態：
 
