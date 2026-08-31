@@ -503,7 +503,8 @@ R3 最易犯錯且錯了回測會失真至不可信，須有專屬測試（見 �
 
 | 陷阱 | 處理 |
 |---|---|
-| **TWSE TLS 憑證缺 Subject Key Identifier** | Python 3.13 `ssl.create_default_context()` 預設啟用 `VERIFY_X509_STRICT` 會拒絕。**一律使用 `requests`（走 urllib3，不套該旗標），禁用 `urllib.request`**。憑證仍有驗證，**不得使用 `verify=False`** |
+| **台灣交易所 TLS 憑證缺 Subject Key Identifier** | 見 §9.4 —— 原先「改用 `requests` 即可」的結論**經實際執行證明不足**，已修正 |
+| **TPEx 在 Cloudflare 後，會回 520 與截斷回應** | 見 §9.5 |
 | **TDCC 為 CSV + UTF-8 BOM** | 以 `utf-8-sig` 解碼，非 JSON |
 | **TPEx 三大法人欄位名含不一致空格** | 如 `' Foreign Investors ...-Total Sell'`（前導空格）、`'Dealers -TotalSell'`（中間空格）。讀取前須正規化欄位名（去空格、統一大小寫），否則 KeyError |
 | **Yahoo chart 預設不回 adjclose** | 必須帶 `&events=div,split` |
@@ -511,6 +512,44 @@ R3 最易犯錯且錯了回測會失真至不可信，須有專屬測試（見 �
 | **MIS 成交價 `z` 可能為 `"-"`** | 無成交時回傳字串 `"-"`（實測 2330 於 11:53:58 即為此值）。直接 `float()` 會 `ValueError`。fallback 序列：`z` → 前次成交價 → `y`（昨收） |
 | **MIS 需先取 session cookie** | 直接打 `getStockInfo.jsp` 會被拒。須先 GET `mis.twse.com.tw/stock/index.jsp` 建立 session |
 | **免費源皆無 CORS 標頭** | 三個端點實測 `Access-Control-Allow-Origin` 均為 `None`。即時報價必須經 `serve.py` 代理，不可期待瀏覽器直連 |
+
+### 9.4 台灣交易所的 TLS 憑證（修正版）
+
+**原先的結論是錯的。** 設計階段以 `requests` 對 `openapi.twse.com.tw` 連測 8 次全數成功，據此寫下「改用 `requests` 即可」。實際執行管線時，`www.tpex.org.tw` 仍以相同錯誤失敗：
+
+```
+SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED]
+certificate verify failed: Missing Subject Key Identifier'))
+```
+
+**根因**：這些站台由 TWCA 簽發憑證並在多個後端輪替，部分憑證缺少 Subject Key Identifier 擴充欄位。行為是**間歇性**的 —— 同一主機同一天，有時三種 SSL context 全部通過，有時連續三次重試全部失敗。單次探測無法證明安全。
+
+**處置**：`src/http.py` 的 `RelaxedX509Adapter`，僅對下列主機掛載：
+
+```
+openapi.twse.com.tw   www.twse.com.tw   mis.twse.com.tw
+www.tpex.org.tw       opendata.tdcc.com.tw
+```
+
+該 adapter 只清除 `VERIFY_X509_STRICT` 一個旗標；**`verify_mode` 維持 `CERT_REQUIRED`、`check_hostname` 維持 `True`**，憑證鏈、主機名、有效期全部照常驗證。Yahoo／Google／SEC／Wikipedia 維持完整嚴格驗證，不受影響。
+
+**仍然禁用 `verify=False`** —— 那會關閉全部驗證，與本處置有本質差異。測試 `tests/test_http_tls.py` 同時斷言「旗標已清除」與「驗證性質未被削弱」，並斷言非台灣主機沒有被放寬。
+
+### 9.5 TPEx 的 Cloudflare 行為
+
+TPEx 位於 Cloudflare 之後。連續請求實測 8 次僅 2 次成功，兩種失敗型態：
+
+| 型態 | 為何預設重試機制抓不到 |
+|---|---|
+| `HTTPError: 520 Server Error` | 520 是 Cloudflare 專屬碼，不在標準 `(429, 500, 502, 503, 504)` 清單 |
+| `ChunkedEncodingError: Response ended prematurely` | **不是狀態碼錯誤**，發生在 requests 讀取內容階段，urllib3 的 `Retry` 完全攔不到 |
+
+**處置**：
+- `RETRY_STATUS` 加入 Cloudflare 碼 `520, 521, 522, 524`
+- 新增應用層 `get_with_retry()`，捕捉 `ChunkedEncodingError` / `ConnectionError` / `Timeout` 並以指數退避重試（預設 4 次、係數 1.5）
+- 4xx 不重試，立即拋出（重試客戶端錯誤沒有意義）
+
+**若不處理的後果**：上櫃股票會整批抓不到，且因為 §9.1 的降級設計，會**靜默地**從選股池消失而不報錯。
 
 ---
 

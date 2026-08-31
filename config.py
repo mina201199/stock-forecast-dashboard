@@ -30,6 +30,9 @@ TWSE_MIN_INTERVAL = 0.3
 HTTP_TIMEOUT = 45
 HTTP_RETRIES = 3
 HTTP_BACKOFF = 2.0
+# 傳輸層暫時性錯誤（ChunkedEncodingError、Cloudflare 520）的應用層重試
+TRANSIENT_ATTEMPTS = 4
+TRANSIENT_BACKOFF = 1.5
 
 # SEC：留空即停用備援（spec 2.6）。不得填假信箱。
 SEC_CONTACT_EMAIL = ""
