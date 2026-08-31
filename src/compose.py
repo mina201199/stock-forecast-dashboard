@@ -19,6 +19,8 @@ import math
 
 import numpy as np
 
+from src.numeric import all_finite, clamp, is_finite, is_positive
+
 HORIZON_DAYS = 20
 
 BASE_WEIGHTS = {"tech": 0.40, "valuation": 0.40, "analyst": 0.20}
@@ -26,6 +28,15 @@ MIN_BARS_FOR_FULL_TECH = 250
 MIN_BARS_TO_PREDICT = 120
 MIN_ANALYSTS_FOR_FULL_WEIGHT = 5
 TW_NO_FORWARD_EPS_PENALTY = 0.8
+
+# 估值軌道被視為極端值而排除的門檻，以「合理價 / 現價」的比值判斷。
+# 用百分比偏離會不對稱：上檔可以無限大，下檔最多 -100%，
+# 因此 |deviation| > 1.0 在下檔永遠不會觸發。比值在對數尺度上對稱。
+#
+# 同業相對估值在樣本小、商業模式異質時會產生無意義的數字 ——
+# 實測金融股 AIG（保險）被拿去與 Apollo（資產管理）比 PB，
+# 算出「合理價是現價四倍」。那不是資訊，是雜訊，不該加權進合成。
+VALUATION_OUTLIER_RATIO = 2.0
 
 SENTIMENT_CAP = 0.05
 DEVIATION_ALERT = 0.50
@@ -52,10 +63,10 @@ def _tech_prices(price: float, tech: dict | None) -> dict | None:
     大盤預期報酬取 0（假設大盤持平）—— 大盤是預測不到的，這個前提
     必須顯示在頁面上，不能藏起來。
     """
-    if not tech or price <= 0:
+    if not tech or not is_positive(price):
         return None
     q10, q50, q90 = tech.get("tech_q10"), tech.get("tech_q50"), tech.get("tech_q90")
-    if any(v is None or not np.isfinite(v) for v in (q10, q50, q90)):
+    if not all_finite((q10, q50, q90)):
         return None
     return {"low": price * (1 + q10), "fair": price * (1 + q50), "high": price * (1 + q90)}
 
@@ -95,13 +106,24 @@ def blend(
     tech_prices = _tech_prices(price, tech)
     if tech_prices:
         tracks["tech"] = tech_prices
-    if valuation and all(valuation.get(k) for k in ("low", "fair", "high")):
-        tracks["valuation"] = {k: float(valuation[k]) for k in ("low", "fair", "high")}
-    if analyst and analyst.get("target_mean"):
+    excluded: list[str] = []
+    if valuation and all_finite(valuation.get(k) for k in ("low", "fair", "high")):
+        ratio = float(valuation["fair"]) / price
+        if ratio > VALUATION_OUTLIER_RATIO or ratio < 1 / VALUATION_OUTLIER_RATIO:
+            excluded.append(
+                f"基本面估值算出的合理價是現價的 {ratio:.1f} 倍（{ratio - 1:+.0%}），"
+                "超出合理範圍，已排除不納入合成"
+                "（同業樣本過小或商業模式差異過大時會出現此情形）"
+            )
+        else:
+            tracks["valuation"] = {k: float(valuation[k]) for k in ("low", "fair", "high")}
+    if analyst and is_finite(analyst.get("target_mean")):
+        mean = float(analyst["target_mean"])
+        low, high = analyst.get("target_low"), analyst.get("target_high")
         tracks["analyst"] = {
-            "low": float(analyst.get("target_low") or analyst["target_mean"]),
-            "fair": float(analyst["target_mean"]),
-            "high": float(analyst.get("target_high") or analyst["target_mean"]),
+            "low": float(low) if is_finite(low) else mean,
+            "fair": mean,
+            "high": float(high) if is_finite(high) else mean,
         }
 
     if not tracks:
@@ -124,8 +146,9 @@ def blend(
 
     # 新聞情緒只做封頂微調，不主導
     adjustment = 0.0
-    if sentiment is not None:
-        adjustment = max(-SENTIMENT_CAP, min(SENTIMENT_CAP, sentiment * SENTIMENT_CAP))
+    if is_finite(sentiment):
+        bounded = clamp(float(sentiment) * SENTIMENT_CAP, -SENTIMENT_CAP, SENTIMENT_CAP)
+        adjustment = 0.0 if bounded is None else bounded
         blended = {k: v * (1 + adjustment) for k, v in blended.items()}
 
     low, fair, high = sorted(blended.values())
@@ -137,6 +160,7 @@ def blend(
         "tracks": {name: tracks[name] for name in tracks},
         "weights": {name: round(w / total, 4) for name, w in active.items()},
         "sentiment_adjustment": adjustment,
+        "excluded_tracks": excluded,
     }
 
 
@@ -150,11 +174,11 @@ def _agreement_score(tracks: dict[str, dict]) -> float | None:
     看起來合理、實際上毫無意義的數字。正確做法是明確顯示分歧並
     壓低信心，而不是把矛盾平均掉。
     """
-    fairs = [t["fair"] for t in tracks.values() if t.get("fair")]
+    fairs = [float(t["fair"]) for t in tracks.values() if is_finite(t.get("fair"))]
     if len(fairs) < 2:
         return None
     mean = float(np.mean(fairs))
-    if mean <= 0:
+    if not is_positive(mean):
         return None
     cv = float(np.std(fairs) / mean)
     return float(100.0 * math.exp(-6.0 * cv))
@@ -164,30 +188,31 @@ def _completeness_score(features: dict) -> float:
     total = len(features)
     if total == 0:
         return 0.0
-    present = sum(
-        1 for v in features.values()
-        if v is not None and not (isinstance(v, float) and math.isnan(v))
-    )
+    present = sum(1 for v in features.values() if is_finite(v))
     return 100.0 * present / total
 
 
 def _interval_score(tech: dict | None, volatility: float | None) -> float | None:
     """預測區間寬度相對該檔波動度正規化。窄則信心高。"""
-    if not tech or volatility is None or volatility <= 0:
+    if not tech or not is_positive(volatility):
         return None
     q10, q90 = tech.get("tech_q10"), tech.get("tech_q90")
-    if q10 is None or q90 is None:
+    if not all_finite((q10, q90)):
         return None
-    horizon_vol = volatility * math.sqrt(HORIZON_DAYS / 252.0)
+    horizon_vol = float(volatility) * math.sqrt(HORIZON_DAYS / 252.0)
     ratio = (q90 - q10) / (2 * horizon_vol) if horizon_vol else None
     if ratio is None:
         return None
     return float(100.0 * math.exp(-max(ratio, 0.0)))
 
 
+PEER_SCOPE_PENALTY = {"industry": 1.0, "market": 0.75, None: 0.5}
+
+
 def confidence(
     *, tracks: dict[str, dict], features: dict, tech: dict | None,
     volatility: float | None, model_accuracy: float | None,
+    peer_scope: str | None = "industry",
 ) -> dict:
     """0-100 信心度與四因子拆解。
 
@@ -199,7 +224,9 @@ def confidence(
         "模型歷史準確度": (model_accuracy, 0.25),
         "預測區間寬度": (_interval_score(tech, volatility), 0.20),
     }
-    usable = {k: (v, w) for k, (v, w) in factors.items() if v is not None}
+    # is_finite 而非 `is not None`：NaN 通得過 None 檢查，
+    # 之後在夾取階段會被 min/max 變成 100（見 src/numeric.py）
+    usable = {k: (float(v), w) for k, (v, w) in factors.items() if is_finite(v)}
     if not usable:
         return {"score": 0.0, "factors": {k: None for k in factors},
                 "coverage": 0.0, "weights": {k: w for k, (_, w) in factors.items()}}
@@ -211,11 +238,18 @@ def confidence(
     # 產生 100 分的信心度 —— 那是把「沒有反證」誤當成「有正面證據」。
     coverage = total_weight / sum(w for _, w in factors.values())
     score = raw * (COVERAGE_FLOOR + (1 - COVERAGE_FLOOR) * coverage)
+
+    # 估值來自「同市場全體」而非「同市場同產業」時較粗略，須折價
+    if "valuation" in tracks:
+        score *= PEER_SCOPE_PENALTY.get(peer_scope, 0.5)
+
+    clamped = clamp(score, 0.0, 100.0)
     return {
-        "score": float(max(0.0, min(100.0, score))),
+        "score": 0.0 if clamped is None else clamped,
         "coverage": round(coverage, 3),
+        "peer_scope": peer_scope,
         "factors": {
-            k: (round(factors[k][0], 1) if factors[k][0] is not None else None)
+            k: (round(float(factors[k][0]), 1) if is_finite(factors[k][0]) else None)
             for k in factors
         },
         "weights": {k: w for k, (_, w) in factors.items()},
@@ -256,7 +290,7 @@ def classify_trend(f: dict) -> str:
 
 def sanity_check(result: dict, *, price: float, bars: int) -> dict:
     """最後一道防線（spec 7.5）。"""
-    alerts: list[str] = []
+    alerts: list[str] = list(result.get("excluded_tracks") or [])
 
     if bars < MIN_BARS_TO_PREDICT:
         return {
@@ -267,7 +301,7 @@ def sanity_check(result: dict, *, price: float, bars: int) -> dict:
         }
 
     upside = result.get("upside_pct")
-    if upside is not None and abs(upside) > DEVIATION_ALERT:
+    if is_finite(upside) and abs(float(upside)) > DEVIATION_ALERT:
         alerts.append(
             f"目標價偏離現價 {upside:+.0%}，超過 {DEVIATION_ALERT:.0%}，"
             "多為資料異常而非真有此空間"
@@ -275,8 +309,9 @@ def sanity_check(result: dict, *, price: float, bars: int) -> dict:
         result = {**result, "confidence": min(result.get("confidence", 0.0), 50.0)}
 
     directions = {
-        name: (1 if track["fair"] > price else -1)
+        name: (1 if float(track["fair"]) > price else -1)
         for name, track in (result.get("tracks") or {}).items()
+        if is_finite(track.get("fair"))
     }
     if len(set(directions.values())) > 1:
         alerts.append("三軌方向分歧：不同方法對後續走勢看法相反")

@@ -153,22 +153,58 @@ def test_estimate_survives_all_missing_fundamentals():
                       industry=None, peer_pes=[], peer_pbs=[], peer_yields=[]) is None
 
 
-def test_peer_values_fall_back_to_whole_market_when_industry_too_small():
+def test_peers_never_cross_markets():
+    """實測踩到的坑：PE 14 的美國保險股被拿去對上含台股半導體的混合池，
+    算出「合理價」是現價的四倍。台美股的估值水準與會計基礎不可混比。
+    """
     rows = pd.DataFrame({
-        "industry": ["小產業"] + ["大產業"] * 9,
-        "pe": [11.0] + [20.0] * 9,
+        "market": ["US"] * 6 + ["TW"] * 6,
+        "industry": ["Financials"] * 6 + ["半導體業"] * 6,
+        "pe": [12.0] * 6 + [40.0] * 6,
     })
-    peers = V.industry_peer_values(rows, "小產業", "pe")
-    assert len(peers) == 10  # 同業不足 MIN_PEERS，退回全市場
+    peers, scope = V.industry_peer_values(rows, "US", "Financials", "pe")
+    assert peers == [12.0] * 6
+    assert scope == "industry"
+    assert 40.0 not in peers
 
 
-def test_peer_values_use_industry_when_large_enough():
+def test_peers_fall_back_to_same_market_not_global():
     rows = pd.DataFrame({
-        "industry": ["半導體業"] * 6 + ["金融業"] * 4,
-        "pe": [15.0] * 6 + [9.0] * 4,
+        "market": ["US"] * 6 + ["TW"] * 6,
+        "industry": ["Energy"] + ["Tech"] * 5 + ["半導體業"] * 6,
+        "pe": [9.0] + [30.0] * 5 + [40.0] * 6,
     })
-    peers = V.industry_peer_values(rows, "半導體業", "pe")
-    assert peers == [15.0] * 6
+    peers, scope = V.industry_peer_values(rows, "US", "Energy", "pe")
+    assert scope == "market"
+    assert len(peers) == 6            # 只有美股
+    assert 40.0 not in peers          # 台股沒有混進來
+
+
+def test_peers_return_none_scope_when_market_sample_too_small():
+    """連同市場樣本都不足時不給估值，而不是給一個爛數字。"""
+    rows = pd.DataFrame({
+        "market": ["US"] * 2 + ["TW"] * 20,
+        "industry": ["Energy"] * 2 + ["半導體業"] * 20,
+        "pe": [9.0] * 2 + [40.0] * 20,
+    })
+    peers, scope = V.industry_peer_values(rows, "US", "Energy", "pe")
+    assert peers == [] and scope is None
+
+
+def test_estimate_returns_none_when_scope_is_none():
+    assert V.estimate(price=100.0, pe=10.0, pb=1.0, dividend_yield=None,
+                      industry="X", peer_pes=[10.0] * 8, peer_pbs=[1.0] * 8,
+                      peer_yields=[1.0] * 8, peer_scope=None) is None
+
+
+def test_estimate_reports_peer_scope():
+    out = V.estimate(
+        price=100.0, pe=10.0, pb=1.0, dividend_yield=None, industry="X",
+        peer_pes=[14.0, 17.0, 20.0, 23.0, 26.0, 20.0],
+        peer_pbs=[1.4, 1.7, 2.0, 2.3, 2.6, 2.0],
+        peer_yields=[1.0] * 6, peer_scope="market",
+    )
+    assert out["peer_scope"] == "market"
 
 
 def test_identical_peers_collapse_band_to_a_point():

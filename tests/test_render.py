@@ -248,3 +248,12 @@ def test_write_html_creates_file(tmp_path):
     target = render.write_html(_payload(), tmp_path / "out.html")
     assert target.exists()
     assert "股勢" in target.read_text(encoding="utf-8")
+
+
+def test_empty_board_explains_why_rather_than_staying_silent():
+    """榜單空的時候要說得出差在哪一項，否則無從判斷是市場如此還是程式壞了。"""
+    out = render.build_html(_payload(boards={
+        "bullish": [], "bullish_note": "48 檔預測為正、7 檔信心度達 60，但無一同時滿足兩者。",
+        "undervalued": [], "chips": [], "events": [],
+    }))
+    assert "但無一同時滿足兩者" in out

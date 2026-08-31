@@ -15,6 +15,7 @@ from src import compose, features, risk, store
 from src.models import sentiment as sentiment_model
 from src.models import technical as tech_model
 from src.models import valuation as valuation_model
+from src.numeric import is_finite
 
 BENCHMARKS = {"TW": config.TW_BENCHMARK, "US": config.US_BENCHMARK}
 CHART_DAYS = 250
@@ -31,6 +32,21 @@ def _load_panel(conn) -> pd.DataFrame:
         " FROM prices ORDER BY symbol, date", conn
     )
     return stocks, prices
+
+
+def _nan_to_none(records: dict[str, dict]) -> dict[str, dict]:
+    """pandas 會把 SQLite 的 NULL 讀成 NaN。
+
+    NaN 通得過 `is not None` 與 `if not x` 這類守衛，一路傳到夾取階段
+    會被 min/max 變成上界 —— 實測曾讓「完全沒有資料」顯示為
+    「信心度 100」。在讀取層就轉回 None，從源頭斷掉這條路徑。
+    詳見 src/numeric.py。
+    """
+    return {
+        key: {k: (v if is_finite(v) or isinstance(v, str) else None)
+              for k, v in row.items()}
+        for key, row in records.items()
+    }
 
 
 def _latest_by(conn, table: str, order_column: str) -> pd.DataFrame:
@@ -168,14 +184,14 @@ def analyse(conn, now: datetime | None = None) -> dict:
     predictions, report = train_and_predict(panel, benchmark)
     accuracy = _model_accuracy(report)
 
-    fund_by = fundamentals.set_index("symbol").to_dict("index")
-    analyst_by = analysts.set_index("symbol").to_dict("index")
-    insti_by = institutional.set_index("symbol").to_dict("index")
-    margin_by = margin.set_index("symbol").to_dict("index")
-    holders_by = holders.set_index("symbol").to_dict("index")
+    fund_by = _nan_to_none(fundamentals.set_index("symbol").to_dict("index"))
+    analyst_by = _nan_to_none(analysts.set_index("symbol").to_dict("index"))
+    insti_by = _nan_to_none(institutional.set_index("symbol").to_dict("index"))
+    margin_by = _nan_to_none(margin.set_index("symbol").to_dict("index"))
+    holders_by = _nan_to_none(holders.set_index("symbol").to_dict("index"))
 
     # 同業比較用的橫斷面表
-    peer_frame = stocks[["symbol", "industry"]].copy()
+    peer_frame = stocks[["symbol", "industry", "market"]].copy()
     peer_frame["pe"] = peer_frame["symbol"].map(
         lambda s: (fund_by.get(s) or {}).get("pe"))
     peer_frame["pb"] = peer_frame["symbol"].map(
@@ -214,15 +230,17 @@ def analyse(conn, now: datetime | None = None) -> dict:
         )
         volatilities.append(risk_metrics["volatility_252d"])
 
+        peer_pes, scope = valuation_model.industry_peer_values(
+            peer_frame, meta["market"], meta.get("industry"), "pe")
+        peer_pbs, _ = valuation_model.industry_peer_values(
+            peer_frame, meta["market"], meta.get("industry"), "pb")
+        peer_yields, _ = valuation_model.industry_peer_values(
+            peer_frame, meta["market"], meta.get("industry"), "dividend_yield")
         val = valuation_model.estimate(
             price=price, pe=fund.get("pe"), pb=fund.get("pb"),
             dividend_yield=fund.get("dividend_yield"), industry=meta.get("industry"),
-            peer_pes=valuation_model.industry_peer_values(
-                peer_frame, meta.get("industry"), "pe"),
-            peer_pbs=valuation_model.industry_peer_values(
-                peer_frame, meta.get("industry"), "pb"),
-            peer_yields=valuation_model.industry_peer_values(
-                peer_frame, meta.get("industry"), "dividend_yield"),
+            peer_pes=peer_pes, peer_pbs=peer_pbs, peer_yields=peer_yields,
+            peer_scope=scope,
         )
 
         stock_news = news[news["symbol"] == symbol].to_dict("records")
@@ -242,6 +260,7 @@ def analyse(conn, now: datetime | None = None) -> dict:
             conf = compose.confidence(
                 tracks=blended["tracks"], features=feature_values, tech=tech,
                 volatility=risk_metrics["volatility_252d"], model_accuracy=accuracy,
+                peer_scope=(val or {}).get("peer_scope"),
             )
             blended["confidence"] = conf["score"]
             blended["confidence_factors"] = conf["factors"]
@@ -358,18 +377,30 @@ def build_boards(results: list[dict], now: datetime) -> dict:
     """四個榜單（spec 7.4）。純粹是依客觀條件過濾與排序，不是推薦。"""
     predictable = [r for r in results if r["prediction"].get("predictable")]
 
+    positive = [r for r in predictable if (r["prediction"].get("upside_pct") or 0) > 0]
+    confident = [r for r in predictable if r["prediction"].get("confidence", 0) >= 60]
     bullish = sorted(
-        [r for r in predictable
-         if (r["prediction"].get("upside_pct") or 0) > 0
-         and r["prediction"].get("confidence", 0) >= 60],
+        [r for r in positive if r["prediction"].get("confidence", 0) >= 60],
         key=lambda r: r["prediction"]["upside_pct"], reverse=True,
     )[:30]
+    # 榜單空的時候要說得出「差在哪一項」，否則使用者無從判斷是市場如此
+    # 還是程式壞了。門檻不因為榜單空就放寬 —— 那等於為了填版面而降標準。
+    bullish_note = None
+    if not bullish:
+        bullish_note = (
+            f"{len(positive)} 檔預測為正、{len(confident)} 檔信心度達 60，"
+            f"但無一同時滿足兩者。"
+            f"（{len(results) - len(predictable)} 檔因資料或訊號品質不予預測）"
+        )
 
+    # 排除偏離過大的估值：同業相對法在樣本結構特殊時會產生極端值，
+    # 那多半反映樣本問題而非真實的低估空間（spec 7.5 同一門檻）。
     undervalued = sorted(
         [r for r in results
          if r["valuation"] and r["price"] < (r["valuation"].get("low") or 0)
          and (r["fundamentals"].get("pe") or 0) > 0
-         and (r["fundamentals"].get("revenue_yoy") or 0) > 0],
+         and (r["fundamentals"].get("revenue_yoy") or 0) > 0
+         and abs(r["valuation"]["upside_pct"]) <= compose.DEVIATION_ALERT],
         key=lambda r: r["valuation"]["upside_pct"], reverse=True,
     )[:30]
 
@@ -392,6 +423,7 @@ def build_boards(results: list[dict], now: datetime) -> dict:
 
     return {
         "bullish": [_board_row(r) for r in bullish],
+        "bullish_note": bullish_note,
         "undervalued": [_board_row(r) for r in undervalued],
         "chips": [_board_row(r) for r in chips],
         "events": [{**_board_row(r), "event_date": r["event_date"],

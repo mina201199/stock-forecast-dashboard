@@ -139,7 +139,8 @@
               esc(r.code || r.symbol) + "</span></span>" +
               '<span class="vv ' + meta.cls(r) + '">' + meta.value(r) + "</span></div>";
           }).join("")
-        : '<div class="board-empty">目前沒有符合條件的標的</div>';
+        : '<div class="board-empty">' +
+          esc(BOARDS[meta.key + "_note"] || "目前沒有符合條件的標的") + "</div>";
       return '<div class="board"><h3>' + meta.title + "</h3>" +
         '<div class="why">' + esc(meta.why) + "</div>" + body + "</div>";
     }).join("");

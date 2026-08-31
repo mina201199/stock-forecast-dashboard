@@ -324,3 +324,80 @@ def test_more_factors_beats_fewer_at_equal_quality():
         model_accuracy=100.0,
     )
     assert many["score"] > few["score"]
+
+
+# --- 估值樣本層級折價 -------------------------------------------------
+
+
+def test_market_scope_valuation_is_discounted():
+    """估值只用「同市場全體」而非「同市場同產業」時較粗略，信心度須折價。"""
+    tracks = {"tech": {"fair": 100.0}, "valuation": {"fair": 101.0}}
+    kwargs = dict(tracks=tracks, features={"a": 1}, tech=_tech(),
+                  volatility=0.30, model_accuracy=60.0)
+    industry = C.confidence(peer_scope="industry", **kwargs)
+    market = C.confidence(peer_scope="market", **kwargs)
+    assert market["score"] < industry["score"]
+    assert market["peer_scope"] == "market"
+
+
+def test_scope_penalty_only_applies_when_valuation_is_a_track():
+    """沒有用到估值軌道時，估值樣本層級不該影響信心度。"""
+    tracks = {"tech": {"fair": 100.0}, "analyst": {"fair": 101.0}}
+    kwargs = dict(tracks=tracks, features={"a": 1}, tech=_tech(),
+                  volatility=0.30, model_accuracy=60.0)
+    assert C.confidence(peer_scope="industry", **kwargs)["score"] == \
+        C.confidence(peer_scope="market", **kwargs)["score"]
+
+
+# --- 估值極端值排除 ---------------------------------------------------
+
+
+def test_extreme_valuation_is_excluded_from_the_blend():
+    """實測案例：金融股 AIG 的 PB 被拿去與資產管理商比較，算出四倍合理價。
+    那不是資訊，不該加權進合成。
+    """
+    out = _blend(price=76.63, tech=_tech(0.0, 0.02, 0.05),
+                 valuation={"low": 200.0, "fair": 305.77, "high": 400.0})
+    assert "valuation" not in out["tracks"]
+    assert out["excluded_tracks"]
+    assert "已排除" in out["excluded_tracks"][0]
+
+
+def test_reasonable_valuation_is_kept():
+    out = _blend(price=100.0, valuation={"low": 95.0, "fair": 112.0, "high": 130.0})
+    assert "valuation" in out["tracks"]
+    assert out["excluded_tracks"] == []
+
+
+def test_extreme_downside_valuation_is_also_excluded():
+    out = _blend(price=100.0, valuation={"low": 1.0, "fair": 2.0, "high": 3.0})
+    assert "valuation" not in out["tracks"]
+
+
+def test_exclusion_reason_reaches_the_alerts():
+    blended = _blend(price=76.63, tech=_tech(0.0, 0.02, 0.05),
+                     valuation={"low": 200.0, "fair": 305.77, "high": 400.0})
+    blended["confidence"] = 80.0
+    out = C.sanity_check(blended, price=76.63, bars=750)
+    assert any("已排除" in a for a in out["alerts"])
+
+
+def test_blend_returns_none_when_only_track_was_an_outlier():
+    """唯一的軌道被排除後就沒有依據可給目標價。"""
+    assert _blend(price=100.0, tech=None, analyst=None,
+                  valuation={"low": 300.0, "fair": 400.0, "high": 500.0}) is None
+
+
+def test_outlier_threshold_is_symmetric_in_ratio_space():
+    """用百分比偏離會不對稱：下檔最多 -100%，門檻 100% 永遠不觸發。"""
+    # 2.5 倍 -> 排除
+    assert "valuation" not in _blend(
+        price=100.0, valuation={"low": 200.0, "fair": 250.0, "high": 300.0})["tracks"]
+    # 1/2.5 倍 -> 也要排除
+    assert "valuation" not in _blend(
+        price=100.0, valuation={"low": 30.0, "fair": 40.0, "high": 50.0})["tracks"]
+    # 1.8 倍與 1/1.8 倍 -> 都保留
+    assert "valuation" in _blend(
+        price=100.0, valuation={"low": 150.0, "fair": 180.0, "high": 200.0})["tracks"]
+    assert "valuation" in _blend(
+        price=100.0, valuation={"low": 50.0, "fair": 56.0, "high": 60.0})["tracks"]

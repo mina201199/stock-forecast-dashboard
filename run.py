@@ -28,12 +28,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_server() -> int:
+    """啟動本地即時模式（spec 8.6）。僅綁 127.0.0.1。"""
+    from src.serve import serve as make_server
+
+    if not config.OUT_HTML.exists():
+        print("index.html 不存在，請先執行一次 python run.py", file=sys.stderr)
+        return 1
+
+    server = make_server()
+    host, port = server.server_address[0], server.server_address[1]
+    print(f"即時模式已啟動： http://{host}:{port}")
+    print("  台股報價為 TWSE MIS 即時值；美股經 Yahoo，延遲約 15 分鐘。")
+    print("  按 Ctrl+C 結束。")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止。")
+    finally:
+        server.server_close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.serve:
-        print(_NOT_YET.format(name="--serve"), file=sys.stderr)
-        return 2
+        return _run_server()
 
     conn = store.connect(config.DB_PATH)
     store.init_schema(conn)

@@ -8,10 +8,10 @@ spec 原訂「取該檔過去 3 年 PE 的 P20/P50/P80」。但 fundamentals 表
 其實只是股價乘上一個常數 —— 算出來的「PE 帶狀」就是價格帶狀，
 名義上是估值、實質上沒有任何基本面資訊。那是自欺。
 
-改用**同業相對估值**：拿該檔的 PE／PB／殖利率與「同產業其他個股」的
-分佈比較。這是用當下就真實存在的橫斷面資料，不需要歷史累積。
-待 fundamentals 累積滿 250 個交易日後，own_history 方法會自動接手
-（見 select_method 的 history 分支）。
+改用**同業相對估值**：拿該檔的 PE／PB／殖利率與「同市場同產業其他
+個股」的分佈比較。這是用當下就真實存在的橫斷面資料，不需要歷史累積。
+
+比較範圍絕不跨市場 —— 見 industry_peer_values 的說明。
 
 三種方法依股票性質選用：
 - PE 法：EPS > 0 的一般股（主力）
@@ -23,10 +23,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.numeric import all_finite, is_finite, is_positive
+
 FINANCIAL_KEYWORDS = ("金融", "保險", "銀行", "證券", "Financial", "Bank", "Insurance")
 HIGH_YIELD_THRESHOLD = 4.0
 MIN_PEERS = 5
-OWN_HISTORY_MIN_POINTS = 250
 
 PERCENTILES = (0.2, 0.5, 0.8)
 
@@ -37,7 +38,7 @@ def is_financial(industry: str | None) -> bool:
 
 
 def _peer_bands(values: list[float | None]) -> tuple[float, float, float] | None:
-    valid = [v for v in values if v is not None and np.isfinite(v) and v > 0]
+    valid = [float(v) for v in values if is_positive(v)]
     if len(valid) < MIN_PEERS:
         return None
     low, mid, high = np.quantile(valid, PERCENTILES)
@@ -50,7 +51,7 @@ def pe_band(price: float, pe: float | None, peer_pes: list[float | None]) -> dic
     EPS 由 price / pe 反推，因此 pe 必須為正 —— 虧損公司的 PE 在 TWSE
     是空字串，早已在解析階段轉成 None（見 src/parsing.py）。
     """
-    if not pe or pe <= 0 or price <= 0:
+    if not is_positive(pe) or not is_positive(price):
         return None
     bands = _peer_bands(peer_pes)
     if bands is None:
@@ -62,7 +63,7 @@ def pe_band(price: float, pe: float | None, peer_pes: list[float | None]) -> dic
 
 def pb_band(price: float, pb: float | None, peer_pbs: list[float | None]) -> dict | None:
     """股價淨值比法。給金融股、資產股，以及 EPS <= 0 時的替代。"""
-    if not pb or pb <= 0 or price <= 0:
+    if not is_positive(pb) or not is_positive(price):
         return None
     bands = _peer_bands(peer_pbs)
     if bands is None:
@@ -80,7 +81,7 @@ def yield_band(
 
     殖利率與價格反向，故高殖利率百分位對應低價，回傳前需反轉上下界。
     """
-    if not dividend_yield or dividend_yield <= 0 or price <= 0:
+    if not is_positive(dividend_yield) or not is_positive(price):
         return None
     bands = _peer_bands(peer_yields)
     if bands is None:
@@ -103,7 +104,7 @@ def select_weights(
         weights = {"PE": 0.0, "PB": 1.0, "YIELD": 0.0}
     else:
         weights = {"PE": 0.7, "PB": 0.3, "YIELD": 0.0}
-    if dividend_yield and dividend_yield > HIGH_YIELD_THRESHOLD:
+    if is_finite(dividend_yield) and float(dividend_yield) > HIGH_YIELD_THRESHOLD:
         weights = {k: v * 0.75 for k, v in weights.items()}
         weights["YIELD"] = 0.25
     total = sum(weights.values())
@@ -112,10 +113,13 @@ def select_weights(
 
 def combine(estimates: list[dict], weights: dict[str, float]) -> dict | None:
     """加權合成。只計入實際算得出來的方法，並重新正規化權重。"""
-    usable = [e for e in estimates if e and weights.get(e["method"], 0) > 0]
+    def _ok(e):
+        return e is not None and all_finite(e.get(k) for k in ("low", "fair", "high"))
+
+    usable = [e for e in estimates if _ok(e) and weights.get(e["method"], 0) > 0]
     if not usable:
         # 沒有任何偏好方法可用時，退回任何算得出來的方法
-        usable = [e for e in estimates if e]
+        usable = [e for e in estimates if _ok(e)]
         if not usable:
             return None
         weights = {e["method"]: 1.0 for e in usable}
@@ -138,9 +142,12 @@ def estimate(
     peer_pes: list[float | None],
     peer_pbs: list[float | None],
     peer_yields: list[float | None],
+    peer_scope: str | None = "industry",
 ) -> dict | None:
-    """單檔的合理價區間。回傳 low/fair/high/methods/upside_pct。"""
-    if price is None or price <= 0:
+    """單檔的合理價區間。回傳 low/fair/high/methods/upside_pct/peer_scope。"""
+    if peer_scope is None:
+        return None  # 連同市場樣本都不足，不給估值
+    if not is_positive(price):
         return None
     estimates = [
         pe_band(price, pe, peer_pes),
@@ -148,7 +155,7 @@ def estimate(
         yield_band(price, dividend_yield, peer_yields),
     ]
     weights = select_weights(
-        eps_positive=bool(pe and pe > 0),
+        eps_positive=is_positive(pe),
         financial=is_financial(industry),
         dividend_yield=dividend_yield,
     )
@@ -156,15 +163,32 @@ def estimate(
     if combined is None:
         return None
     combined["upside_pct"] = combined["fair"] / price - 1
+    combined["peer_scope"] = peer_scope
     return combined
 
 
 def industry_peer_values(
-    rows: pd.DataFrame, industry: str | None, column: str
-) -> list[float | None]:
-    """同產業其他個股的某欄位值。產業未知時退回全市場。"""
+    rows: pd.DataFrame, market: str, industry: str | None, column: str
+) -> tuple[list[float | None], str | None]:
+    """同業比較的樣本，以及樣本的來源層級。
+
+    **絕不跨市場比較。** 台股與美股的本益比水準、產業結構、會計基礎
+    都不同，混在一起會產生垃圾：實測把 PE 14 的美國保險股拿去對上
+    含台股半導體的混合池，算出的「合理價」是現價的四倍。
+
+    退回層級：
+      "industry" 同市場同產業（樣本 >= MIN_PEERS）—— 最可信
+      "market"   同市場全體 —— 可用但較粗略，信心度會反映
+      None       連同市場樣本都不足 —— 不給估值，而不是給一個爛數字
+    """
+    same_market = rows[rows["market"] == market]
+
     if industry:
-        peers = rows[rows["industry"] == industry]
+        peers = same_market[same_market["industry"] == industry]
         if len(peers) >= MIN_PEERS:
-            return peers[column].tolist()
-    return rows[column].tolist()
+            return peers[column].tolist(), "industry"
+
+    if len(same_market) >= MIN_PEERS:
+        return same_market[column].tolist(), "market"
+
+    return [], None
