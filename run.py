@@ -8,11 +8,24 @@ import argparse
 import sys
 
 import config
-from src import analysis, render, store
+from src import accuracy, analysis, render, store
 from src.http import RateLimiter, YahooClient, make_session
 from src.pipeline import fetch_all
 
 _NOT_YET = "此模式屬後續階段，尚未實作：{name}"
+
+
+def _make_console_forgiving() -> None:
+    """避免因為一個裝飾字元而崩潰。
+
+    Windows 主控台預設是 cp950，遇到 U+26A0（警告符號）之類的字元會
+    直接 UnicodeEncodeError —— 實測 `--accuracy` 就是這樣掛掉的。
+    改成 errors="replace"：cp950 本來就能表示繁體中文，只有少數符號
+    退化成 ?，訊息內容仍然完整。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -23,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--only", metavar="SYMBOL", help="單檔除錯")
     parser.add_argument("--serve", action="store_true", help="啟動本地即時模式")
     parser.add_argument("--backtest", action="store_true", help="產出回測驗證報告")
+    parser.add_argument("--accuracy", action="store_true",
+                        help="比對已留存的預測與實際走勢")
     parser.add_argument("--tw", type=int, default=config.TW_COUNT, help="台股檔數")
     parser.add_argument("--us", type=int, default=config.US_COUNT, help="美股檔數")
     return parser
@@ -50,11 +65,50 @@ def _run_server() -> int:
     return 0
 
 
+def _report_accuracy() -> int:
+    """比對留存的預測與實際走勢（見 src/accuracy.py）。"""
+    conn = store.connect(config.DB_PATH)
+    store.init_schema(conn)
+    try:
+        scored = accuracy.score(conn)
+        if scored.frame.empty:
+            print("沒有可比對的預測紀錄。先執行一次 python run.py 留存預測，"
+                  "隔一個交易日之後再回來看。", file=sys.stderr)
+            return 1
+
+        print(f"預測期間 {scored.horizon_days} 個交易日"
+              f"｜留存筆數 {len(scored.frame)}")
+        for market, summary in sorted(accuracy.by_market(scored).items()):
+            print(f"\n[{market}]")
+            for line in accuracy.format_summary(summary):
+                print(line)
+        print("\n[全體]")
+        for line in accuracy.format_summary(accuracy.summarise(scored)):
+            print(line)
+
+        misses = accuracy.worst_misses(scored)
+        if not misses.empty:
+            print("\n誤差最大的幾檔：")
+            for _, r in misses.iterrows():
+                print(f"  {r['symbol']:<10} {str(r.get('name') or '')[:10]:<12}"
+                      f"預測 {r['upside_pct']:+7.1%}"
+                      f"  實際超額 {r['actual_excess']:+7.2%}"
+                      f"  信心 {r['confidence']:.0f}"
+                      f"  ({int(r['elapsed_days'])} 日)")
+    finally:
+        conn.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    _make_console_forgiving()
     args = build_parser().parse_args(argv)
 
     if args.serve:
         return _run_server()
+
+    if args.accuracy:
+        return _report_accuracy()
 
     conn = store.connect(config.DB_PATH)
     store.init_schema(conn)
@@ -99,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"技術面模型未訓練：{report['reason']}")
 
+        # 留存預測：唯一能誠實回答「它到底準不準」的方式。回測用歷史資料，
+        # 會受選樣與調參影響；留存的預測是事前寫死的，事後無從修改。
+        saved = accuracy.save_snapshot(conn, payload)
+
         target = render.write_html(payload)
         size_mb = target.stat().st_size / 1024 / 1024
         predictable = sum(
@@ -107,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"已產生 {target}（{size_mb:.2f} MB）")
         print(f"  {len(payload['stocks'])} 檔中 {predictable} 檔提供預測值，"
               f"其餘因資料或訊號品質不足而不給預測")
+        print(f"  已留存 {saved} 筆預測供事後驗證（python run.py --accuracy）")
     finally:
         conn.close()
     return 0
