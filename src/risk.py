@@ -5,8 +5,12 @@
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
+
+from src.numeric import is_positive
 
 TRADING_DAYS = 252
 LEVELS = ("極低", "低", "中", "高", "極高")
@@ -78,4 +82,36 @@ def compute(adjclose: pd.Series, benchmark: pd.Series | None, turnover: float | 
         "beta": beta(adjclose, benchmark) if benchmark is not None else None,
         "max_drawdown": max_drawdown(adjclose),
         "turnover_ma20": turnover,
+    }
+
+
+# --- 波動區間 -----------------------------------------------------------
+
+# 常態假設下約對應 10/90 百分位，與原本 low/high 的語意一致
+BAND_K = 1.28
+
+
+def volatility_band(*, price: float, annual_vol: float, horizon_days: int) -> dict | None:
+    """以實現波動度推出的價格區間（spec §4.3）。
+
+    **這是描述性的，不是預測。** 它取代原本 `compose._tech_prices()` 用
+    LightGBM 分位數乘現價的做法 —— 那組分位數的校準從未驗證，實測產出
+    「Adobe 一個月 +37.1%」「建通 +37.9%」這類數字，而它們的信心度全部
+    都是 40（分歧上限與顯示門檻相等所致）。
+
+    區間 = 現價 × (1 ± k·σ·√(N/252))，σ 取年化實現波動度。
+
+    常態假設是明講的簡化：股價報酬有厚尾，實際覆蓋率會低於 80%。
+    這句限制必須跟著區間一起顯示。
+
+    波動度不可用時回 None，**不得退化成「區間等於現價」** ——
+    那會把「不知道」呈現成「非常確定」。
+    """
+    if not is_positive(price) or not is_positive(annual_vol) or horizon_days <= 0:
+        return None
+    spread = BAND_K * float(annual_vol) * math.sqrt(horizon_days / TRADING_DAYS)
+    return {
+        "low": max(0.0, float(price) * (1.0 - spread)),
+        "high": float(price) * (1.0 + spread),
+        "spread": spread,
     }

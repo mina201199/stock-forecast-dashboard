@@ -13,17 +13,19 @@ def conn(tmp_path):
     c.close()
 
 
-def test_creates_all_eleven_tables(conn):
-    """spec 4：11 張表。"""
+def test_creates_all_declared_tables(conn):
+    """原 spec 4 的 11 張表，加上 signal_stats（訊號基準率，見
+    2026-09-10 spec §3.6）—— 共 12 張。"""
     rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     names = {r["name"] for r in rows}
     expected = {
         "stocks", "prices", "fundamentals", "analyst", "institutional",
         "margin", "dividends", "holders", "news", "predictions", "meta",
+        "signal_stats",
     }
     assert expected <= names
     assert set(store.TABLES) == expected
-    assert len(store.TABLES) == 11
+    assert len(store.TABLES) == 12
 
 
 def test_init_schema_is_idempotent(conn):

@@ -92,3 +92,44 @@ def test_compute_returns_all_keys_even_without_benchmark():
     }
     assert out["beta"] is None
     assert out["turnover_ma20"] == 1e8
+
+
+# --- 波動區間（spec §4.3：取代未經驗證的分位數目標價）------------------
+
+
+def test_volatility_band_is_symmetric_around_price():
+    band = risk.volatility_band(price=100.0, annual_vol=0.30, horizon_days=20)
+    assert band["low"] < 100.0 < band["high"]
+    assert (100.0 - band["low"]) == pytest.approx(band["high"] - 100.0)
+
+
+def test_volatility_band_widens_with_horizon():
+    narrow = risk.volatility_band(price=100.0, annual_vol=0.30, horizon_days=5)
+    wide = risk.volatility_band(price=100.0, annual_vol=0.30, horizon_days=20)
+    assert wide["high"] > narrow["high"]
+
+
+def test_volatility_band_widens_with_volatility():
+    calm = risk.volatility_band(price=100.0, annual_vol=0.10, horizon_days=20)
+    wild = risk.volatility_band(price=100.0, annual_vol=0.60, horizon_days=20)
+    assert wild["high"] > calm["high"]
+
+
+def test_volatility_band_matches_the_documented_formula():
+    """區間 = 現價 × (1 ± k·σ·√(N/252))，k = 1.28。"""
+    import math
+    expected = 1.28 * 0.30 * math.sqrt(20 / 252)
+    band = risk.volatility_band(price=100.0, annual_vol=0.30, horizon_days=20)
+    assert band["high"] == pytest.approx(100.0 * (1 + expected))
+
+
+def test_volatility_band_returns_none_without_usable_volatility():
+    """沒有波動度就沒有區間。不得退化成「區間等於現價」。"""
+    assert risk.volatility_band(price=100.0, annual_vol=float("nan"), horizon_days=20) is None
+    assert risk.volatility_band(price=float("nan"), annual_vol=0.3, horizon_days=20) is None
+
+
+def test_volatility_band_floor_is_never_negative():
+    """極高波動時下緣不得變成負價格。"""
+    band = risk.volatility_band(price=100.0, annual_vol=5.0, horizon_days=20)
+    assert band["low"] >= 0.0

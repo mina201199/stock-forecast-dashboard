@@ -14,6 +14,7 @@ import config
 TABLES = (
     "stocks", "prices", "fundamentals", "analyst", "institutional",
     "margin", "dividends", "holders", "news", "predictions", "meta",
+    "signal_stats",
 )
 
 _SCHEMA = """
@@ -75,6 +76,17 @@ CREATE TABLE IF NOT EXISTS predictions (
     PRIMARY KEY (symbol, run_date)
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+CREATE TABLE IF NOT EXISTS signal_stats (
+    signal_key TEXT NOT NULL, market TEXT NOT NULL, horizon INTEGER NOT NULL,
+    n_fires INTEGER, n_effective INTEGER,
+    hit_rate REAL, baseline_hit_rate REAL, median_excess REAL,
+    ci_low REAL, ci_high REAL, p_value REAL, p_adjusted REAL,
+    first_half_excess REAL, second_half_excess REAL,
+    first_half_median REAL, second_half_median REAL,
+    verdict TEXT NOT NULL, computed_at TEXT,
+    PRIMARY KEY (signal_key, market, horizon)
+);
 """
 
 

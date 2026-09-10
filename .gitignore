@@ -12,3 +12,9 @@ index.html
 
 # 視覺化 brainstorm 伺服器工作目錄
 .superpowers/
+
+# 每日日報產出（可由 run.py --digest 重新產生）
+out/
+
+# 個人資金設定（含本金金額，不入版控）；範例見 portfolio.toml.example
+portfolio.toml
