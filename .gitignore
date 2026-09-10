@@ -18,3 +18,6 @@ out/
 
 # 個人資金設定（含本金金額，不入版控）；範例見 portfolio.toml.example
 portfolio.toml
+
+# 排程執行紀錄
+logs/
