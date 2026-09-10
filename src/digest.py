@@ -18,12 +18,18 @@
 """
 from __future__ import annotations
 
+import html as html_mod
 import json
+import re
 from pathlib import Path
+from typing import NamedTuple
 
 from src.numeric import is_finite
 
 SIZE_BUDGET_BYTES = 50 * 1024
+# HTML 內嵌樣式並為每一檔畫區間條，必然比 markdown 大。貼外部工具用的是
+# markdown，這份是拿來看和列印的，所以上限放寬但仍然是上限。
+HTML_SIZE_BUDGET_BYTES = 400 * 1024
 STALE_AFTER_DAYS = 3
 
 VERDICT_LABELS = {
@@ -258,15 +264,276 @@ def render_markdown(data: dict) -> str:
     return "\n".join(lines)
 
 
-def write(data: dict, out_dir: Path | str) -> tuple[Path, Path]:
+
+# --- 微型圖表（內嵌 SVG，無 JS、無 library）---------------------------
+#
+# 為什麼不用圖表庫：這份 HTML 必須自我包含 —— 可列印、可存檔、可寄給
+# 別人，三年後打開還是能顯示。任何 CDN 依賴都會讓存檔版本壞掉。
+#
+# 配色的關鍵決定：本專案沿用台股慣例（紅漲綠跌），而 #d92b3a ↔ #10893e
+# 的 deutan ΔE 實測只有 5.0，低於 6–8 的最低容許帶 —— 色盲讀者分不出來。
+# 在單一頁面裡改成相反慣例會比色盲問題更誤導，所以顏色保留、但一律降為
+# 冗余資訊：極性由位置（零線左右）與正負號各自獨立表達。
+
+BAR_W = 132
+BAR_H = 8
+EXCESS_FULL_SCALE = 0.10   # 雙向長條的滿格值（±10%）
+
+
+def _hit_bar(hit: float, baseline: float) -> str:
+    """勝率長條 + 基準刻度。
+
+    刻意**不用**極性色：這裡的問題是「贏不贏過基準」，答案靠刻度與
+    長條末端的相對位置就讀得出來，不需要顏色參與。
+    """
+    if not is_finite(hit):
+        return ""
+    width = max(0.0, min(1.0, float(hit))) * BAR_W
+    title = f"勝率 {hit:.1%}"
+    if is_finite(baseline):
+        title += f"，同市場未觸發基準 {baseline:.1%}"
+    parts = [
+        f'<svg class="hit-bar" width="{BAR_W}" height="{BAR_H}" '
+        f'viewBox="0 0 {BAR_W} {BAR_H}" role="img">',
+        f"<title>{html_mod.escape(title)}</title>",
+        f'<rect class="track" x="0" y="0" width="{BAR_W}" height="{BAR_H}" '
+        f'rx="{BAR_H / 2}"/>',
+        f'<rect class="bar-fill" x="0" y="0" width="{width:.1f}" '
+        f'height="{BAR_H}" rx="{BAR_H / 2}"/>',
+    ]
+    if is_finite(baseline):
+        x = max(0.0, min(1.0, float(baseline))) * BAR_W
+        parts.append(
+            f'<rect class="baseline-tick" x="{x - 1:.1f}" y="-2" '
+            f'width="2" height="{BAR_H + 4}"/>'
+        )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _excess_bar(value: float) -> str:
+    """前後半超額的雙向長條。
+
+    `data-sign` 讓極性在 DOM 層就有結構性表達，不只存在於 fill 顏色裡。
+    """
+    if not is_finite(value):
+        return ""
+    half = BAR_W / 2
+    frac = max(-1.0, min(1.0, float(value) / EXCESS_FULL_SCALE))
+    width = max(abs(frac) * half, 1.5)
+    sign = "pos" if value > 0 else ("neg" if value < 0 else "zero")
+    x = half if frac >= 0 else half - width
+    return (
+        f'<svg class="excess-bar" width="{BAR_W}" height="{BAR_H}" '
+        f'viewBox="0 0 {BAR_W} {BAR_H}" role="img">'
+        f"<title>{value:+.2%}</title>"
+        f'<rect class="track" x="0" y="0" width="{BAR_W}" height="{BAR_H}" '
+        f'rx="{BAR_H / 2}"/>'
+        f'<rect class="{sign}" data-sign="{sign}" x="{x:.1f}" y="0" '
+        f'width="{width:.1f}" height="{BAR_H}" rx="4"/>'
+        f'<rect class="zero-rule" x="{half - 0.5}" y="-2" width="1" '
+        f'height="{BAR_H + 4}"/>'
+        "</svg>"
+    )
+
+
+def _spread_bar(spread: float, max_spread: float) -> str:
+    """波動區間的**寬度**量值條。
+
+    刻意不畫「區間 + 現價標記」：區間是現價 × (1 ± spread)，現價恆在
+    正中央 —— 標記畫出來每一列都在中點，等於沒有編碼任何資訊。
+    真正有變化的是寬度，所以畫寬度。
+    """
+    if not is_finite(spread) or not is_finite(max_spread) or max_spread <= 0:
+        return ""
+    width = max(min(float(spread) / float(max_spread), 1.0), 0.0) * (BAR_W * 0.55)
+    return (
+        f'<svg class="spread-bar" width="{BAR_W * 0.55:.0f}" height="{BAR_H - 2}" '
+        f'viewBox="0 0 {BAR_W * 0.55:.0f} {BAR_H - 2}" role="img">'
+        f"<title>±{spread:.1%}</title>"
+        f'<rect class="track" x="0" y="0" width="{BAR_W * 0.55:.0f}" '
+        f'height="{BAR_H - 2}" rx="{(BAR_H - 2) / 2}"/>'
+        f'<rect class="spread-fill" x="0" y="0" width="{width:.1f}" '
+        f'height="{BAR_H - 2}" rx="{(BAR_H - 2) / 2}"/>'
+        "</svg>"
+    )
+
+
+# --- 為 template 預先格式化 -------------------------------------------
+
+
+def _prepare_groups(data: dict) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for verdict, rows in data.get("signals", {}).items():
+        prepared = []
+        for g in rows:
+            symbols = [e["symbol"] for e in g["symbols"]]
+            prepared.append({
+                **g,
+                "hit_txt": _pct(g["hit_rate"]),
+                "baseline_txt": _pct(g["baseline_hit_rate"]),
+                "median_txt": _pct(g["median_excess"], 2),
+                "p_txt": (f"{g['p_adjusted']:.3f}"
+                          if is_finite(g.get("p_adjusted")) else ""),
+                "first_txt": _signed(g.get("first_half_median")),
+                "second_txt": _signed(g.get("second_half_median")),
+                "hit_svg": _hit_bar(g["hit_rate"], g["baseline_hit_rate"]),
+                "first_svg": _excess_bar(g.get("first_half_median")),
+                "second_svg": _excess_bar(g.get("second_half_median")),
+                "symbols_txt": "、".join(symbols),
+                "n_symbols": len(symbols),
+            })
+        out[verdict] = prepared
+    return out
+
+
+def _signed(value) -> str:
+    return f"{value:+.1%}" if is_finite(value) else "—"
+
+
+def _prepare_bands(data: dict) -> list[dict]:
+    bands = data.get("bands", [])
+    spreads = []
+    for b in bands:
+        price, high = b.get("price"), b.get("high")
+        spreads.append(
+            (float(high) / float(price) - 1.0)
+            if is_finite(price) and is_finite(high) and float(price) > 0
+            else float("nan")
+        )
+    usable = [s for s in spreads if is_finite(s)]
+    peak = max(usable) if usable else float("nan")
+
+    rows = []
+    for b, spread in zip(bands, spreads, strict=True):
+        rows.append({
+            "symbol": b["symbol"],
+            "price": f"{b['price']:,.2f}",
+            "low": f"{b['low']:,.2f}",
+            "high": f"{b['high']:,.2f}",
+            "spread": f"±{spread:.1%}" if is_finite(spread) else "—",
+            "svg": _spread_bar(spread, peak),
+        })
+    return rows
+
+
+_BOLD = re.compile(r"\*\*(.+?)\*\*")
+
+
+def _prepare_plan(data: dict) -> list[dict]:
+    """把資金算術的行轉成 HTML。
+
+    這裡是兩個 renderer 唯一共用「已格式化文字」的地方，而那是個 wart ——
+    `run.py._plan_lines` 產出的是 markdown。比較乾淨的形狀是讓它回傳
+    結構化資料、兩邊各自格式化。目前用一個範圍明確的最小子集轉換
+    （只有 `**粗體**` 與清單縮排），因為那些行是我們自己的程式產生的，
+    不是任意 markdown。
+    """
+    plan = data.get("plan")
+    if not plan:
+        return []
+    lines = plan if isinstance(plan, list) else [str(plan)]
+
+    rows = []
+    for raw in lines:
+        text = str(raw)
+        if not text.strip():
+            continue
+        kind = ""
+        if text.startswith("    - "):
+            kind, text = "sub", text[6:]
+        elif text.startswith("- "):
+            text = text[2:]
+        elif text.startswith("> "):
+            kind, text = "note", text[2:]
+        elif text.startswith("合計"):
+            kind = "total"
+        if "超過你設定" in text:
+            kind = "flag"
+        escaped = html_mod.escape(text)
+        rows.append({"kind": kind, "html": _BOLD.sub(r"<strong>\1</strong>", escaped)})
+    return rows
+
+
+_ACCURACY_FLAG = re.compile(r"\s*<-\s*(.+)$")
+
+
+def _prepare_accuracy(data: dict) -> list[dict]:
+    """把準度摘要的字串切成 label / value / flag。
+
+    這是在解析我們自己 `accuracy.format_summary()` 的輸出，範圍明確但
+    確實脆弱。解不開時整行當 label —— 退化的結果仍然可讀，不會掉資料。
+    """
+    rows = []
+    for raw in data.get("accuracy_lines", []):
+        text = str(raw).rstrip()
+        if not text:
+            continue
+        flag = ""
+        match = _ACCURACY_FLAG.search(text)
+        if match:
+            flag = match.group(1).strip()
+            text = text[: match.start()].rstrip()
+        if text.lstrip().startswith("[!]"):
+            rows.append({"label": text.strip(), "value": "", "flag": flag})
+            continue
+        parts = re.split(r"\s{2,}", text.strip(), maxsplit=1)
+        if len(parts) == 2:
+            rows.append({"label": parts[0], "value": parts[1], "flag": flag})
+        else:
+            rows.append({"label": text.strip(), "value": "", "flag": flag})
+    return rows
+
+
+def render_html(data: dict) -> str:
+    """單一自我包含的 HTML 頁面。與 `render_markdown` 吃同一個 build() 輸出，
+    所以兩種格式在內容上不可能不一致 —— 它們是同一份資料的兩個視圖。"""
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+    from src import render
+
+    template_dir = Path(__file__).parent / "templates"
+    env = Environment(
+        loader=FileSystemLoader(template_dir),
+        autoescape=select_autoescape(["html"]),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    return env.get_template("digest.html.j2").render(
+        data=data,
+        labels=VERDICT_LABELS,
+        groups=_prepare_groups(data),
+        band_rows=_prepare_bands(data),
+        plan_rows=_prepare_plan(data),
+        accuracy_rows=_prepare_accuracy(data),
+        disclaimer=render.DISCLAIMER,
+        style=(template_dir / "digest.css").read_text(encoding="utf-8"),
+    )
+
+
+class DigestFiles(NamedTuple):
+    markdown: Path
+    json: Path
+    html: Path
+
+
+def write(data: dict, out_dir: Path | str) -> DigestFiles:
+    """三種格式，同一份資料。
+
+    markdown 是貼進外部工具的那一份（12 KB 量級），HTML 是拿來看和列印的，
+    JSON 是給程式讀的。三者都由 `build()` 的同一個輸出產生。
+    """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     stamp = data.get("as_of") or "unknown"
 
     md_path = out / f"daily-{stamp}.md"
     json_path = out / f"daily-{stamp}.json"
+    html_path = out / f"daily-{stamp}.html"
+
     md_path.write_text(render_markdown(data), encoding="utf-8")
     json_path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
-    return md_path, json_path
+    html_path.write_text(render_html(data), encoding="utf-8")
+    return DigestFiles(md_path, json_path, html_path)

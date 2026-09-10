@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>每日訊號日報 {{ data.as_of }}</title>
+<style>{{ style | safe }}</style>
+</head>
+<body>
+
+{# 訊號卡片。所有文字與 SVG 都在 Python 側先格式化好，template 保持笨。 #}
+{% macro signal_card(g, show_halves) %}
+<div class="sig">
+  <div class="sig-head">
+    <span class="sig-name">{{ g.signal_name }}</span>
+    <span class="sig-key">{{ g.signal }} / {{ g.market }}</span>
+  </div>
+  <div class="stats">
+    <span class="metric">勝率 <b>{{ g.hit_txt }}</b>{{ g.hit_svg | safe }}<span class="chip">基準 {{ g.baseline_txt }}</span></span>
+    <span>中位超額 <b>{{ g.median_txt }}</b></span>
+    <span>有效樣本 <b>{{ g.n_effective }}</b></span>
+    {% if g.p_txt %}<span>p 校正 <b>{{ g.p_txt }}</b></span>{% endif %}
+  </div>
+  {% if show_halves %}
+  <div class="stats" style="margin-top:6px">
+    <span class="metric">前半 <b>{{ g.first_txt }}</b>{{ g.first_svg | safe }}</span>
+    <span class="metric">後半 <b>{{ g.second_txt }}</b>{{ g.second_svg | safe }}</span>
+  </div>
+  {% endif %}
+  <div class="symbols">{{ g.symbols_txt }} <span class="n">（{{ g.n_symbols }} 檔）</span></div>
+</div>
+{% endmacro %}
+
+<div class="disclaimer">⚠ {{ disclaimer }}</div>
+
+<div class="wrap">
+
+  <div class="page-head">
+    <h1>每日訊號<span>日報</span></h1>
+    <div class="sub">資料基準日 {{ data.as_of }}　｜　上次成功抓取 {{ data.last_success or '未知' }}</div>
+  </div>
+
+  {# --- 1. 準度計分卡：必須第一 ------------------------------------- #}
+  <section>
+    <h2><span class="idx">1</span>準度計分卡</h2>
+
+    {% if data.stale %}
+    <div class="stale">
+      ⚠ 資料已過期：距今 {{ data.fetch_lag_days }} 天未成功抓取。
+      排程可能已靜默失敗，下面所有數字都可能是舊的。
+    </div>
+    {% endif %}
+
+    <div class="card score">
+      {% for line in accuracy_rows %}
+      <div class="score-line">
+        <span class="k">{{ line.label }}</span>
+        <span class="v">{{ line.value }}{% if line.flag %} <span class="chip warn">{{ line.flag }}</span>{% endif %}</span>
+      </div>
+      {% endfor %}
+    </div>
+
+    <p class="note">這一節放最上面，是因為它決定你該多信下面的東西。</p>
+  </section>
+
+  {# --- 2. 訊號 ------------------------------------------------------ #}
+  <section>
+    <h2><span class="idx">2</span>今日觸發的訊號</h2>
+
+    <h3>有統計優勢</h3>
+    {% if groups.edge %}
+      {% for g in groups.edge %}{{ signal_card(g, false) }}{% endfor %}
+    {% else %}
+    <div class="empty">
+      <strong>沒有任何訊號通過統計優勢的門檻。</strong>
+      這不是「今天沒觸發」，而是十個訊號在三年歷史上都沒有可證實的預測力
+      —— 所以今天沒有任何標的能被稱為買點。
+    </div>
+    {% endif %}
+
+    {% for bucket in ('unstable', 'no_edge', 'insufficient') %}
+      {% if groups[bucket] %}
+      <h3>{{ labels[bucket] }}<span class="tag">僅供參考，不是買點</span></h3>
+      {% if bucket == 'unstable' %}
+      <p class="note">
+        全期看起來顯著，但分前後半期後效果反向 —— 多半是把一段特定行情
+        冒充成預測力。下方雙向長條的方向（零線左右）與正負號各自獨立
+        表達極性，不依賴紅綠。
+      </p>
+      {% endif %}
+      {% for g in groups[bucket] %}{{ signal_card(g, bucket == 'unstable') }}{% endfor %}
+      {% endif %}
+    {% endfor %}
+
+    {% if data.unrated %}
+    <h3>沒有基準率的訊號<span class="tag">不得作為買點</span></h3>
+    <div class="card">
+      {% for row in data.unrated %}
+      <div class="score-line">
+        <span class="k">{{ row.symbol }}（{{ row.signal }}）</span>
+        <span class="v">尚未量測歷史勝率</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </section>
+
+  {# --- 3. 波動區間 -------------------------------------------------- #}
+  <section>
+    <h2><span class="idx">3</span>波動區間</h2>
+    {% if band_rows %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>標的</th><th>現價</th><th>區間下緣</th><th>區間上緣</th>
+            <th>幅度</th><th>相對寬度</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for b in band_rows %}
+          <tr>
+            <td>{{ b.symbol }}</td>
+            <td>{{ b.price }}</td>
+            <td>{{ b.low }}</td>
+            <td>{{ b.high }}</td>
+            <td>{{ b.spread }}</td>
+            <td>{{ b.svg | safe }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="card">（無）</div>
+    {% endif %}
+    <p class="note">
+      這是以歷史波動度推出的<strong>描述性</strong>區間，不是方向預測；
+      中位數不宣稱漲跌。區間為現價 × (1 ± k·σ·√(N/252))，k = 1.28，
+      σ 取 60 日年化實現波動度。常態假設下約對應 10/90 百分位 ——
+      股價報酬有厚尾，實際覆蓋率會低於 80%。因為區間對現價對稱，
+      這裡畫的是<strong>寬度</strong>而不是位置：位置每一列都在正中，
+      畫出來不會編碼任何資訊。
+    </p>
+  </section>
+
+  {# --- 4. 資金算術 -------------------------------------------------- #}
+  <section>
+    <h2><span class="idx">4</span>資金算術</h2>
+    {% if plan_rows %}
+    <div class="card plan">
+      {% for row in plan_rows %}
+      <div class="row {{ row.kind }}">{{ row.html | safe }}</div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="card">（未提供 portfolio.toml，略）</div>
+    {% endif %}
+  </section>
+
+  {# --- 5. 資料缺口 -------------------------------------------------- #}
+  {% if data.degraded %}
+  <section>
+    <h2><span class="idx">5</span>資料缺口與降級來源</h2>
+    <div class="card">
+      {% for item in data.degraded %}
+      <div class="score-line"><span class="k">{{ item }}</span></div>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  <div class="foot">
+    <strong>勝率如何量出來的</strong>：訊號在三年歷史上的每一次觸發，
+    量測其後 5／10／20 個交易日相對同市場基準（0050.TW／SPY）的超額報酬。
+    信賴區間用按日期的 block bootstrap（同一天所有標的一起重抽），
+    並對全部檢定做 Benjamini-Hochberg 校正。<br>
+
+    <strong>有效樣本</strong>是「訊號觸發過的、互不重疊的日期區塊數」，
+    不是觸發次數 —— 20 日的前瞻窗口讓連續觸發共用結果，而同市場個股同漲同跌。
+    名目觸發數千次而有效樣本只有二十幾，是常態而非異常。<br>
+
+    <strong>{{ disclaimer }}</strong>
+  </div>
+
+</div>
+</body>
+</html>

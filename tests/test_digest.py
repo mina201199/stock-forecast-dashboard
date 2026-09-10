@@ -198,7 +198,8 @@ def test_write_produces_markdown_and_parseable_json(tmp_path):
         fires=[baserate.Fire("2330.TW", "TW", "a", "2026-09-10", 1000.0)],
         rates=[_rate("a")],
     ))
-    md_path, json_path = digest.write(data, tmp_path)
+    files = digest.write(data, tmp_path)
+    md_path, json_path = files.markdown, files.json
 
     assert md_path.exists() and json_path.exists()
     parsed = json.loads(json_path.read_text(encoding="utf-8"))
@@ -210,7 +211,7 @@ def test_digest_stays_within_size_budget(tmp_path):
     """1.7 MB 的 index.html 貼不進外部工具，日報必須小。"""
     fires = [baserate.Fire(f"S{i}.TW", "TW", "a", "2026-09-10", 100.0) for i in range(120)]
     data = digest.build(_payload(fires=fires, rates=[_rate("a")]))
-    md_path, _ = digest.write(data, tmp_path)
+    md_path = digest.write(data, tmp_path).markdown
     assert md_path.stat().st_size < digest.SIZE_BUDGET_BYTES
 
 
@@ -278,5 +279,168 @@ def test_digest_stays_within_budget_at_production_scale(tmp_path):
         for i in range(500)
     ]
     data = digest.build(_payload(fires=fires, rates=rates, bands=bands))
-    md_path, _ = digest.write(data, tmp_path)
+    md_path = digest.write(data, tmp_path).markdown
     assert md_path.stat().st_size < digest.SIZE_BUDGET_BYTES
+
+
+# --- HTML 版日報 -------------------------------------------------------
+
+
+def _html(**kw):
+    return digest.render_html(digest.build(_payload(**kw)))
+
+
+def test_html_is_self_contained():
+    """不得引用任何外部資源。
+
+    可列印、可存檔、可寄給別人的前提就是這個 —— 一個依賴 CDN 的頁面
+    存到硬碟三年後打開就是壞的。
+    """
+    import re
+    html = _html()
+    assert not re.search(r'(?:src|href)\s*=\s*["\']https?:', html)
+    assert "<script" not in html          # 完全不需要 JS
+    assert "<link" not in html
+
+
+def test_html_has_no_forbidden_phrases():
+    """與 index.html 共用同一份禁語清單（render.FORBIDDEN_PHRASES）。"""
+    from src import render
+    html = _html(
+        fires=[baserate.Fire("2330.TW", "TW", "a", "2026-09-10", 1000.0)],
+        rates=[_rate("a")],
+        bands=[{"symbol": "2330.TW", "price": 1000.0, "low": 900.0, "high": 1100.0}],
+    )
+    for phrase in render.FORBIDDEN_PHRASES:
+        assert phrase not in html, f"產出含禁語：{phrase}"
+
+
+def test_html_is_well_formed():
+    """所有標籤成對關閉。破損的 HTML 在不同瀏覽器會長得不一樣。"""
+    from html.parser import HTMLParser
+
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "source", "track", "wbr"}
+
+    class Checker(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.stack = []
+            self.errors = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag not in VOID:
+                self.stack.append(tag)
+
+        def handle_endtag(self, tag):
+            if not self.stack:
+                self.errors.append(f"多餘的 </{tag}>")
+            elif self.stack[-1] != tag:
+                self.errors.append(f"預期 </{self.stack[-1]}> 卻遇到 </{tag}>")
+            else:
+                self.stack.pop()
+
+    checker = Checker()
+    checker.feed(_html(bands=[
+        {"symbol": "2330.TW", "price": 1000.0, "low": 900.0, "high": 1100.0}]))
+    assert checker.errors == []
+    assert checker.stack == []
+
+
+def test_html_accuracy_scorecard_comes_first():
+    html = _html()
+    assert html.index("準度計分卡") < html.index("今日觸發的訊號")
+
+
+def test_html_states_edge_emptiness_explicitly():
+    assert "沒有任何訊號" in _html()
+
+
+def test_html_labels_non_edge_groups():
+    html = _html(
+        fires=[baserate.Fire("2317.TW", "TW", "b", "2026-09-10", 200.0)],
+        rates=[_rate("b", verdict="no_edge")],
+    )
+    assert "2317.TW" in html
+    assert "無統計優勢" in html
+
+
+def test_html_bands_are_not_called_target_prices():
+    html = _html(bands=[
+        {"symbol": "2330.TW", "price": 1000.0, "low": 900.0, "high": 1100.0}])
+    assert "波動區間" in html
+    assert "目標價" not in html
+
+
+# --- 無障礙：極性不得只靠顏色（dataviz 規則）--------------------------
+
+
+def test_polarity_is_encoded_structurally_not_only_by_colour():
+    """前後半超額的正負，必須靠位置與正負號傳達，不能只靠紅綠。
+
+    實測本專案配色 #10893e（綠）↔ #d92b3a（紅）的 deutan ΔE 只有 5.0，
+    低於 6–8 的最低容許帶 —— 色盲讀者分不出來。紅漲綠跌是台股慣例，
+    在單一頁面裡改成相反慣例會更誤導，所以顏色保留、但降為冗余資訊：
+    方向由 data-sign 與正負號各自獨立表達。
+    """
+    html = _html(
+        fires=[baserate.Fire("2454.TW", "TW", "c", "2026-09-10", 900.0)],
+        rates=[_rate("c", verdict="unstable", first_half_median=-0.014,
+                     second_half_median=0.053)],
+    )
+    assert 'data-sign="neg"' in html
+    assert 'data-sign="pos"' in html
+    assert "-1.4%" in html          # 負號存在於文字
+    assert "+5.3%" in html          # 正號也明確標出
+
+
+def test_hit_rate_bar_does_not_use_the_red_green_pair():
+    """勝率對照不需要極性色。單一色長條 + 中性基準刻度即可，
+    「低於基準」靠位置判讀。"""
+    html = _html(
+        fires=[baserate.Fire("2317.TW", "TW", "b", "2026-09-10", 200.0)],
+        rates=[_rate("b", verdict="no_edge", hit_rate=0.41,
+                     baseline_hit_rate=0.47)],
+    )
+    import re
+    bar = re.search(r'<svg[^>]*class="hit-bar".*?</svg>', html, re.S)
+    assert bar, "找不到勝率長條"
+    assert "#d92b3a" not in bar.group(0)
+    assert "#10893e" not in bar.group(0)
+
+
+def test_light_palette_is_defined_on_bare_root():
+    """深色只在 media query 裡定義會讓淺色模式沒有值可用。"""
+    html = _html()
+    assert ":root" in html
+    assert "--bg:" in html
+
+
+# --- 尺寸與輸出 -------------------------------------------------------
+
+
+def test_html_stays_within_its_own_budget(tmp_path):
+    """HTML 比 markdown 大是預期的（內嵌樣式 + 155 個區間條圖），
+    但仍要有上限。貼外部工具用的是 markdown，不是這個。"""
+    fires = [
+        baserate.Fire(f"S{i}.TW", "TW", f"sig{i % 10}", "2026-09-10", 100.0)
+        for i in range(600)
+    ]
+    rates = [_rate(f"sig{k}", verdict="no_edge") for k in range(10)]
+    bands = [
+        {"symbol": f"S{i}.TW", "price": 100.0, "low": 90.0, "high": 110.0}
+        for i in range(500)
+    ]
+    data = digest.build(_payload(fires=fires, rates=rates, bands=bands))
+    paths = digest.write(data, tmp_path)
+    html_path = next(p for p in paths if p.suffix == ".html")
+    assert html_path.stat().st_size < digest.HTML_SIZE_BUDGET_BYTES
+
+
+def test_write_produces_three_files(tmp_path):
+    """markdown 與 JSON 的角色不變，HTML 是新增的第三個。"""
+    data = digest.build(_payload())
+    paths = digest.write(data, tmp_path)
+    assert {p.suffix for p in paths} == {".md", ".json", ".html"}
+    for p in paths:
+        assert p.exists()

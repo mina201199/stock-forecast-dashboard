@@ -1,0 +1,285 @@
+/* 每日日報的樣式。自我包含、無外部字體、可列印。
+ *
+ * 設計 token 刻意鏡射 style.css，而不是共用一份檔案：抽出共用檔會動到
+ * index.html 的渲染，而那個頁面這次不在範圍內。重複的代價是 30 行，
+ * 換到的是這份檔案完全獨立、改壞它不會影響既有頁面。
+ */
+
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-2: #fbfcfd;
+  --line: #e3e7ec;
+  --line-strong: #cfd6de;
+  --text: #1a1f28;
+  --text-dim: #5c6674;
+  --text-faint: #8b95a3;
+  --accent: #2f6df6;
+  --accent-soft: #e8f0ff;
+  --up: #d92b3a;      /* 台股慣例：紅漲 */
+  --dn: #10893e;      /* 綠跌 */
+  --warn: #b45309;
+  --warn-bg: #fff7e6;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .04);
+  --radius: 10px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1319;
+    --panel: #171c24;
+    --panel-2: #1d2430;
+    --line: #262e3a;
+    --line-strong: #333d4d;
+    --text: #e6ebf2;
+    --text-dim: #9aa5b4;
+    --text-faint: #6b7688;
+    --accent: #5b8cff;
+    --accent-soft: #1b2740;
+    --up: #ff6b6b;
+    --dn: #34d399;
+    --warn: #fbbf24;
+    --warn-bg: #2a2210;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4);
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Noto Sans TC", -apple-system, BlinkMacSystemFont, "Segoe UI",
+               "Microsoft JhengHei", sans-serif;
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.disclaimer {
+  background: var(--warn-bg);
+  border-bottom: 1px solid var(--line);
+  color: var(--warn);
+  font-size: 12.5px;
+  padding: 8px 20px;
+}
+
+.wrap { max-width: 1000px; margin: 0 auto; padding: 24px 20px 64px; }
+
+.page-head { margin-bottom: 26px; }
+.page-head h1 { font-size: 24px; margin: 0 0 6px; letter-spacing: .01em; }
+.page-head h1 span { color: var(--accent); }
+.page-head .sub { color: var(--text-dim); font-size: 12.5px; }
+
+section { margin-bottom: 34px; }
+
+h2 {
+  font-size: 15px;
+  margin: 0 0 4px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+h2 .idx { color: var(--text-faint); font-weight: 400; margin-right: 8px; }
+
+h3 {
+  font-size: 13px;
+  margin: 22px 0 10px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+h3 .tag {
+  font-weight: 400;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  margin-left: 6px;
+}
+
+.note {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  border-left: 2px solid var(--line-strong);
+  padding: 2px 0 2px 12px;
+  margin: 10px 0;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px 18px;
+}
+
+/* --- 1. 準度計分卡 --------------------------------------------------- */
+
+.score { display: grid; gap: 10px; }
+.score-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 13px;
+  padding: 3px 0;
+  border-bottom: 1px dashed var(--line);
+}
+.score-line:last-child { border-bottom: 0; }
+.score-line .k { color: var(--text-dim); }
+.score-line .v { font-family: var(--mono); white-space: pre; }
+
+.chip {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 99px;
+  border: 1px solid var(--line-strong);
+  color: var(--text-dim);
+  background: var(--panel-2);
+  white-space: nowrap;
+}
+.chip.warn { color: var(--warn); background: var(--warn-bg); border-color: var(--warn); }
+
+.stale {
+  background: var(--warn-bg);
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  font-size: 13px;
+  margin-bottom: 12px;
+  font-weight: 600;
+}
+
+/* --- 2. 訊號 --------------------------------------------------------- */
+
+.empty {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  font-size: 13.5px;
+}
+
+.sig {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  padding: 13px 16px;
+  margin-bottom: 10px;
+  box-shadow: var(--shadow);
+}
+.sig-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.sig-name { font-weight: 600; font-size: 14px; }
+.sig-key { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 20px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.stats b { font-family: var(--mono); color: var(--text); font-weight: 600; }
+
+.metric { display: flex; align-items: center; gap: 8px; }
+
+.symbols {
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px dashed var(--line);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.9;
+  word-break: break-all;
+}
+.symbols .n { color: var(--text-faint); }
+
+/* --- 3. 波動區間 ----------------------------------------------------- */
+
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+thead th {
+  text-align: right;
+  font-weight: 600;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--line-strong);
+  padding: 7px 10px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+thead th:first-child, tbody td:first-child { text-align: left; }
+tbody td {
+  text-align: right;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+tbody tr:hover { background: var(--panel-2); }
+.table-wrap {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow-x: auto;
+}
+
+/* --- 4. 資金算術 ----------------------------------------------------- */
+
+.plan { font-size: 13px; }
+.plan .row { padding: 3px 0; }
+.plan .row.sub { padding-left: 22px; color: var(--text-dim); font-size: 12px; }
+.plan .row.total {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-strong);
+  font-weight: 600;
+}
+.plan .row.flag { color: var(--warn); font-weight: 600; }
+.plan b { font-family: var(--mono); }
+
+/* --- 圖形 ------------------------------------------------------------ */
+
+svg { display: block; overflow: visible; }
+.track { fill: var(--line); }
+.bar-fill { fill: var(--accent); }
+.baseline-tick { fill: var(--text); }
+.zero-rule { fill: var(--line-strong); }
+.pos { fill: var(--up); }
+.neg { fill: var(--dn); }
+.spread-fill { fill: var(--line-strong); }
+
+.foot {
+  margin-top: 40px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  color: var(--text-faint);
+  font-size: 11.5px;
+  line-height: 1.8;
+}
+.foot strong { color: var(--text-dim); }
+
+/* --- 列印 ------------------------------------------------------------
+ * 不隱藏任何警語。一份把 caveat 藏起來的列印版比純文字更糟。
+ */
+
+@media print {
+  :root {
+    --bg: #fff; --panel: #fff; --panel-2: #fff;
+    --line: #ccc; --line-strong: #999;
+    --text: #000; --text-dim: #333; --text-faint: #555;
+    --shadow: none;
+  }
+  body { font-size: 10.5pt; }
+  .wrap { max-width: none; padding: 0; }
+  .sig, .card, .table-wrap, .empty, .stale { break-inside: avoid; }
+  section { break-inside: auto; }
+  h2, h3 { break-after: avoid; }
+  tbody tr:hover { background: transparent; }
+}

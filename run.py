@@ -350,13 +350,15 @@ def _run_digest(out_dir: Path) -> int:
             "plan": plan,
             "degraded": [],
         })
-        md_path, json_path = digest.write(data, out_dir)
+        files = digest.write(data, out_dir)
         counts = {k: len(v) for k, v in data["signals"].items() if v}
         breakdown = "｜".join(
             f"{digest.VERDICT_LABELS.get(k, k)} {v}" for k, v in sorted(counts.items())
         )
-        print(f"已產出 {md_path}（{md_path.stat().st_size / 1024:.1f} KB）"
-              f"與 {json_path.name}")
+        print(f"已產出 {files.markdown}（{files.markdown.stat().st_size / 1024:.1f} KB）")
+        print(f"  同時產出 {files.html.name}"
+              f"（{files.html.stat().st_size / 1024:.1f} KB，可直接在瀏覽器開）"
+              f"與 {files.json.name}")
         print(f"  今日觸發 {len(fires)} 筆：{breakdown or '無'}")
         if not data["signals"].get("edge"):
             print("  沒有任何訊號有統計優勢，所以日報不指出任何買點。")
