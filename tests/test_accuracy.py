@@ -247,3 +247,58 @@ def test_constant_predictions_report_ic_as_undefined_not_nan():
     assert summary["ic"] is None
     assert summary["ic_undefined"] is True
     assert any("無定義" in line for line in accuracy.format_summary(summary))
+
+
+# --- 重跑同一個資料日必須得到一致的快照（2026-09-10）------------------
+
+
+def test_rerun_removes_rows_for_symbols_that_became_unpredictable(tmp_path):
+    """同一個 run_date 重跑時，已不可預測的個股不得留下舊列。
+
+    `snapshot_rows` 只寫入可預測的個股，所以個股由「可預測」轉為
+    「不可預測」時，舊列不會被覆寫，會留在表裡。實測加上波動區間閘門
+    後 ADBE 由可預測轉為不可預測（預測 +39.5%、區間僅 ±18.1%），
+    但那筆 +39.5% 仍留在 predictions 表裡 —— `--accuracy` 會去評分一個
+    系統已經不再做出的預測。
+
+    只清理**同一個 run_date**。其他日期的留存紀錄是事前寫死的證據，
+    不得因為後來改了程式就回頭修改。
+    """
+    conn = store.connect(tmp_path / "t.db")
+    store.init_schema(conn)
+    try:
+        first = {"stocks": [
+            _stock("ADBE", predictable=True, upside=0.395, as_of="2026-09-08"),
+            _stock("AAPL", predictable=True, upside=0.05, as_of="2026-09-08"),
+        ]}
+        assert accuracy.save_snapshot(conn, first) == 2
+
+        # 加上閘門後 ADBE 不再可預測
+        second = {"stocks": [
+            _stock("ADBE", predictable=False, upside=0.395, as_of="2026-09-08"),
+            _stock("AAPL", predictable=True, upside=0.05, as_of="2026-09-08"),
+        ]}
+        accuracy.save_snapshot(conn, second)
+
+        kept = {r[0] for r in conn.execute("SELECT symbol FROM predictions")}
+        assert kept == {"AAPL"}
+    finally:
+        conn.close()
+
+
+def test_rerun_does_not_touch_other_run_dates(tmp_path):
+    """8/31 留存的證據不得被 9/10 的重跑動到。"""
+    conn = store.connect(tmp_path / "t.db")
+    store.init_schema(conn)
+    try:
+        accuracy.save_snapshot(conn, {"stocks": [
+            _stock("ADBE", predictable=True, upside=0.30, as_of="2026-08-31"),
+        ]})
+        accuracy.save_snapshot(conn, {"stocks": [
+            _stock("ADBE", predictable=False, upside=0.30, as_of="2026-09-08"),
+        ]})
+
+        rows = list(conn.execute("SELECT run_date FROM predictions"))
+        assert [r[0] for r in rows] == ["2026-08-31"]
+    finally:
+        conn.close()

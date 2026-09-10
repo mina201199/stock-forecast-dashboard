@@ -160,7 +160,7 @@ def _model_accuracy(report: dict) -> float | None:
     return float(max(0.0, min(100.0, (ic / 0.15) * 100.0)))
 
 
-def analyse(conn, now: datetime | None = None) -> dict:
+def analyse(conn, now: datetime | None = None, *, edge_fires=()) -> dict:
     now = now or datetime.now(UTC)
     stocks, prices = _load_panel(conn)
     if stocks.empty or prices.empty:
@@ -265,7 +265,10 @@ def analyse(conn, now: datetime | None = None) -> dict:
             blended["confidence"] = conf["score"]
             blended["confidence_factors"] = conf["factors"]
             blended["confidence_weights"] = conf["weights"]
-            blended = compose.sanity_check(blended, price=price, bars=bars)
+            blended = compose.sanity_check(
+                blended, price=price, bars=bars,
+                annual_vol=risk_metrics["volatility_60d"],
+            )
         else:
             blended = {"predictable": False, "confidence": 0.0,
                        "alerts": ["缺少足夠資料，無法產生目標價"],
@@ -322,7 +325,7 @@ def analyse(conn, now: datetime | None = None) -> dict:
     return {
         "stocks": results,
         "report": report,
-        "boards": build_boards(results, now),
+        "boards": build_boards(results, now, edge_fires=edge_fires),
         "generated_at": now.isoformat(timespec="seconds"),
         "horizon_days": config.HORIZON_DAYS,
     }
@@ -373,24 +376,40 @@ def _attach_risk_levels(results: list[dict], volatilities: list[float]) -> None:
         )
 
 
-def build_boards(results: list[dict], now: datetime) -> dict:
-    """四個榜單（spec 7.4）。純粹是依客觀條件過濾與排序，不是推薦。"""
+def build_boards(results: list[dict], now: datetime, *, edge_fires=()) -> dict:
+    """四個榜單（spec 7.4）。純粹是依客觀條件過濾與排序，不是推薦。
+
+    **看多榜改由有統計優勢的訊號驅動**（2026-09-10，spec §4.2）。
+
+    原本以 `prediction.upside_pct` 排序。2026-08-31 留存的 88 筆預測在 9/10
+    回頭比對，證明那個欄位不是報酬預測器：預測漲幅前 12 名的信心度全部
+    都是 40（三軌分歧上限與顯示門檻相等所致），信心度 > 50 的沒有一筆漲幅
+    超過 +0.6%。以它排序的榜單由結構保證只從最不可信的那一格挑股票 ——
+    而那 88 筆的方向命中率正好是 48.9%。
+
+    現在只有「今天觸發了 verdict == edge 訊號」的標的能進榜。順序沿用
+    `edge_fires` 的順序，不再由任何預測值重排。
+    """
     predictable = [r for r in results if r["prediction"].get("predictable")]
 
-    positive = [r for r in predictable if (r["prediction"].get("upside_pct") or 0) > 0]
-    confident = [r for r in predictable if r["prediction"].get("confidence", 0) >= 60]
-    bullish = sorted(
-        [r for r in positive if r["prediction"].get("confidence", 0) >= 60],
-        key=lambda r: r["prediction"]["upside_pct"], reverse=True,
-    )[:30]
-    # 榜單空的時候要說得出「差在哪一項」，否則使用者無從判斷是市場如此
-    # 還是程式壞了。門檻不因為榜單空就放寬 —— 那等於為了填版面而降標準。
+    fired_order: list[str] = []
+    for fire in edge_fires:
+        if fire.symbol not in fired_order:
+            fired_order.append(fire.symbol)
+    by_symbol = {r["symbol"]: r for r in results}
+    bullish = [by_symbol[s] for s in fired_order if s in by_symbol][:30]
+
+    # 榜單空的時候要說得出原因，否則使用者無從判斷是市場如此還是程式壞了。
+    # 這裡的原因通常不是「今天沒人漲」，而是「沒有任何訊號有統計優勢」——
+    # 兩者完全不同，說錯會讓人以為再等幾天就會有。
     bullish_note = None
     if not bullish:
         bullish_note = (
-            f"{len(positive)} 檔預測為正、{len(confident)} 檔信心度達 60，"
-            f"但無一同時滿足兩者。"
-            f"（{len(results) - len(predictable)} 檔因資料或訊號品質不予預測）"
+            "沒有任何訊號通過統計優勢的門檻，因此看多榜為空。"
+            "這不是「今天沒有標的觸發訊號」，而是十個技術面訊號在三年歷史上"
+            "都沒有可證實的預測力（見 python run.py --baserates）。"
+            f"（{len(results)} 檔中 {len(results) - len(predictable)} 檔"
+            "另因資料或訊號品質不予預測）"
         )
 
     # 排除偏離過大的估值：同業相對法在樣本結構特殊時會產生極端值，

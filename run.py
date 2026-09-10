@@ -118,6 +118,27 @@ def _report_accuracy() -> int:
     return 0
 
 
+def _edge_fires(conn) -> tuple:
+    """今天觸發、且該訊號有統計優勢的清單 —— 看多榜的唯一來源。
+
+    沒有任何訊號判為 edge 時直接跳過掃描。掃描要對全部個股再算一次指標，
+    而在沒有 edge 訊號的情況下結果必然是空的 —— 算了是純浪費。
+    這也是目前的實際狀況：60 次檢定裡 0 個 edge。
+    """
+    rates = baserate.load_stats(conn)
+    edge_keys = {
+        (r.signal_key, r.market) for r in rates if r.verdict == "edge"
+    }
+    if not edge_keys:
+        return ()
+
+    frames, _ = baserate.load_frames(conn)
+    usable = [s for s in signals.REGISTRY
+              if any((s.key, m) in edge_keys for m in s.markets)]
+    fires = baserate.scan_latest(usable, frames)
+    return tuple(f for f in fires if (f.signal_key, f.market) in edge_keys)
+
+
 def _run_baserates(n_boot: int) -> int:
     """重算並留存全部訊號的基準率（spec §3.6）。"""
     conn = store.connect(config.DB_PATH)
@@ -390,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         print("計算特徵、訓練模型、合成目標價…", flush=True)
-        payload = analysis.analyse(conn)
+        payload = analysis.analyse(conn, edge_fires=_edge_fires(conn))
         if not payload["stocks"]:
             print("資料庫沒有可分析的個股。先執行一次抓取。", file=sys.stderr)
             return 1

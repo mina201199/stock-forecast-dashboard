@@ -257,10 +257,12 @@ def test_low_confidence_is_not_predictable():
 
 
 def test_clean_case_passes_without_alerts():
+    # annual_vol 是必要輸入：沒有波動度就量不出幅度合理性，而「未知」
+    # 一律不通過（忘記傳參數要 fail closed，不能靜默跳過閘門）。
     out = C.sanity_check(
         {"upside_pct": 0.08, "confidence": 75.0,
          "tracks": {"tech": {"fair": 108.0}, "valuation": {"fair": 106.0}}},
-        price=100.0, bars=750,
+        price=100.0, bars=750, annual_vol=0.30,
     )
     assert out["predictable"] is True
     assert out["alerts"] == []
@@ -401,3 +403,124 @@ def test_outlier_threshold_is_symmetric_in_ratio_space():
         price=100.0, valuation={"low": 150.0, "fair": 180.0, "high": 200.0})["tracks"]
     assert "valuation" in _blend(
         price=100.0, valuation={"low": 50.0, "fair": 56.0, "high": 60.0})["tracks"]
+
+
+# --- §4.1 分歧時不可預測（2026-09-10 修復）-----------------------------
+
+
+def test_conflicting_track_directions_make_it_unpredictable():
+    """三軌方向分歧 -> predictable=False，不是「壓到剛好可以顯示」。
+
+    修復前：分歧把信心度壓到 CONFLICT_CONFIDENCE_CAP=40，而顯示門檻
+    MIN_CONFIDENCE_TO_SHOW 也是 40 —— 兩個常數相等，所以「三軌吵架」
+    和「剛好可以顯示」是同一個數字。實測 88 筆留存預測裡，預測漲幅
+    前 12 名的信心度全部都是 40，而信心度 > 50 的沒有一筆漲幅超過
+    +0.6%：upside_pct 排序其實是分歧偵測器，不是報酬預測器。
+
+    方向分歧代表我們沒有觀點，硬給一個合成中位數是杜撰。
+    """
+    out = C.sanity_check(
+        {"upside_pct": 0.37, "confidence": 95.0,
+         "tracks": {"tech": {"fair": 137.0}, "valuation": {"fair": 70.0}}},
+        price=100.0, bars=750,
+    )
+    assert any("分歧" in a for a in out["alerts"])
+    assert out["predictable"] is False
+
+
+def test_agreeing_tracks_stay_predictable():
+    out = C.sanity_check(
+        {"upside_pct": 0.06, "confidence": 75.0,
+         "tracks": {"tech": {"fair": 108.0}, "valuation": {"fair": 104.0}}},
+        price=100.0, bars=750, annual_vol=0.30,
+    )
+    assert out["predictable"] is True
+
+
+def test_conflict_cap_is_no_longer_equal_to_the_display_floor():
+    """兩個常數相等就是那個 bug 的成因。用測試把它們釘開。"""
+    assert C.CONFLICT_CONFIDENCE_CAP != C.MIN_CONFIDENCE_TO_SHOW
+
+
+# --- §4.4 情緒未計算 ≠ 情緒中性 ---------------------------------------
+
+
+def test_missing_sentiment_is_reported_as_unavailable_not_neutral():
+    """news.sentiment 全為 NULL 時，不得回報 adjustment=0.0 了事。
+
+    0.0 讀起來是「情緒中性」，實際意思是「情緒從未計算」——
+    與 spec 9.4 那個 NaN 變成滿分信心同一類錯誤：把「沒有資料」
+    呈現成一個有意義的值。
+    """
+    out = C.blend(
+        price=100.0,
+        tech={"tech_q10": -0.05, "tech_q50": 0.02, "tech_q90": 0.09},
+        valuation=None, analyst=None, sentiment=None,
+        market="TW", bars=750, has_forward_eps=False,
+    )
+    assert out["sentiment_adjustment"] is None
+    assert out["sentiment_available"] is False
+
+
+def test_present_sentiment_is_applied_and_marked_available():
+    out = C.blend(
+        price=100.0,
+        tech={"tech_q10": -0.05, "tech_q50": 0.02, "tech_q90": 0.09},
+        valuation=None, analyst=None, sentiment=0.5,
+        market="TW", bars=750, has_forward_eps=False,
+    )
+    assert out["sentiment_available"] is True
+    assert out["sentiment_adjustment"] == pytest.approx(0.5 * C.SENTIMENT_CAP)
+
+
+# --- §4.3 幅度合理性：預測不得超出該檔自身的波動區間 -------------------
+
+
+def test_forecast_beyond_the_stock_own_volatility_band_is_unpredictable():
+    """中位預測落在該檔自身 20 日波動區間之外 -> 不可預測。
+
+    分歧閘門抓不到這一類：實測 ADBE 三軌方向**一致**地喊高，
+    合成中位數 +39.5%、信心度 46，照樣出貨並被留存。一個月 +39.5%
+    對 Adobe 不是預測，是假象 —— 它主張這檔會走得比自身波動度所能
+    支撐的還遠。
+
+    波動區間（realized vol，spec §4.3）就是那把尺：年化 30% 的個股，
+    20 個交易日的合理範圍約 ±10.8%。
+    """
+    out = C.sanity_check(
+        {"upside_pct": 0.395, "confidence": 46.0,
+         "tracks": {"tech": {"fair": 139.5}, "valuation": {"fair": 140.0}}},
+        price=100.0, bars=750, annual_vol=0.30,
+    )
+    assert any("波動" in a for a in out["alerts"])
+    assert out["predictable"] is False
+
+
+def test_forecast_inside_the_band_stays_predictable():
+    out = C.sanity_check(
+        {"upside_pct": 0.05, "confidence": 70.0,
+         "tracks": {"tech": {"fair": 105.0}, "valuation": {"fair": 106.0}}},
+        price=100.0, bars=750, annual_vol=0.30,
+    )
+    assert out["predictable"] is True
+
+
+def test_high_volatility_stock_gets_a_wider_allowance():
+    """區間依個股自身波動度而定，不是一個固定的百分比門檻。"""
+    forecast = {"upside_pct": 0.25, "confidence": 70.0,
+                "tracks": {"tech": {"fair": 125.0}, "valuation": {"fair": 126.0}}}
+    calm = C.sanity_check(dict(forecast), price=100.0, bars=750, annual_vol=0.20)
+    wild = C.sanity_check(dict(forecast), price=100.0, bars=750, annual_vol=1.20)
+    assert calm["predictable"] is False
+    assert wild["predictable"] is True
+
+
+def test_missing_volatility_does_not_silently_pass_the_band_check():
+    """沒有波動度就量不出區間。不得因此當成通過 —— 未知不是通過。"""
+    out = C.sanity_check(
+        {"upside_pct": 0.395, "confidence": 70.0,
+         "tracks": {"tech": {"fair": 139.5}, "valuation": {"fair": 140.0}}},
+        price=100.0, bars=750, annual_vol=None,
+    )
+    assert out["predictable"] is False
+    assert any("波動" in a for a in out["alerts"])

@@ -61,7 +61,41 @@ def snapshot_rows(payload: dict) -> list[dict]:
 
 
 def save_snapshot(conn, payload: dict) -> int:
-    return store.upsert(conn, "predictions", snapshot_rows(payload))
+    """留存本次的預測，並讓同一個資料日的重跑得到一致的快照。
+
+    `snapshot_rows` 只寫入可預測的個股，所以個股由「可預測」轉為
+    「不可預測」時，舊列不會被覆寫、會留在表裡。實測加上波動區間閘門
+    後 ADBE 由可預測轉為不可預測（預測 +39.5%，而其自身 20 日波動區間
+    只有 ±18.1%），但那筆 +39.5% 仍留在 predictions 表裡 ——
+    `--accuracy` 會去評分一個系統已經不再做出的預測。
+
+    清理只限**本次寫入的 run_date**。其他日期的留存紀錄是事前寫死的
+    證據，不得因為後來改了程式就回頭修改 —— 那會毀掉留存機制唯一的
+    價值（事後無從修改）。
+    """
+    rows = snapshot_rows(payload)
+
+    # 本次涵蓋的資料日：只有這些日期的舊列可以被清理
+    covered = {
+        stock["as_of"] for stock in payload.get("stocks", [])
+        if stock.get("as_of")
+    }
+    keep = {(r["symbol"], r["run_date"]) for r in rows}
+    for run_date in sorted(covered):
+        existing = conn.execute(
+            "SELECT symbol FROM predictions WHERE run_date = ?", (run_date,)
+        ).fetchall()
+        stale = [
+            row[0] for row in existing if (row[0], run_date) not in keep
+        ]
+        if stale:
+            conn.executemany(
+                "DELETE FROM predictions WHERE symbol = ? AND run_date = ?",
+                [(symbol, run_date) for symbol in stale],
+            )
+    conn.commit()
+
+    return store.upsert(conn, "predictions", rows)
 
 
 @dataclass(frozen=True)

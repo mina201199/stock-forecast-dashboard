@@ -40,7 +40,17 @@ VALUATION_OUTLIER_RATIO = 2.0
 
 SENTIMENT_CAP = 0.05
 DEVIATION_ALERT = 0.50
-CONFLICT_CONFIDENCE_CAP = 40.0
+
+# 三軌方向分歧時的信心度上限。
+#
+# 這個值原本是 40.0，與 MIN_CONFIDENCE_TO_SHOW 相等 —— 兩個常數相等，
+# 使「三軌吵架」與「剛好可以顯示」變成同一個數字。實測 2026-08-31 留存的
+# 88 筆預測：預測漲幅前 12 名的信心度全部都是 40，而信心度 > 50 的沒有
+# 一筆漲幅超過 +0.6%。upside_pct 排序因此不是報酬預測器，而是分歧偵測器。
+#
+# 現在分歧直接判定為不可預測（見 sanity_check），這個上限只是額外的
+# 數值下壓；它必須嚴格低於顯示門檻，測試會把兩者釘開。
+CONFLICT_CONFIDENCE_CAP = 25.0
 # 可計算因子涵蓋率不足時的折價下限：涵蓋率 0 時保留 50%
 COVERAGE_FLOOR = 0.5
 MIN_CONFIDENCE_TO_SHOW = 40.0
@@ -144,8 +154,14 @@ def blend(
         for key in ("low", "fair", "high")
     }
 
-    # 新聞情緒只做封頂微調，不主導
-    adjustment = 0.0
+    # 新聞情緒只做封頂微調，不主導。
+    #
+    # **未計算 ≠ 中性。** 回報 0.0 讀起來是「情緒中性」，實際意思可能是
+    # 「情緒從未計算」—— 實測 news.sentiment 9,340 筆全為 NULL（原 spec 6.3
+    # 設計了詞典法但未實作）。把「沒有資料」呈現成一個有意義的值，
+    # 正是 spec 9.4 那個 NaN 變成滿分信心的同一類錯誤。所以缺值時
+    # adjustment 為 None，並另外標示 sentiment_available。
+    adjustment = None
     if is_finite(sentiment):
         bounded = clamp(float(sentiment) * SENTIMENT_CAP, -SENTIMENT_CAP, SENTIMENT_CAP)
         adjustment = 0.0 if bounded is None else bounded
@@ -160,6 +176,7 @@ def blend(
         "tracks": {name: tracks[name] for name in tracks},
         "weights": {name: round(w / total, 4) for name, w in active.items()},
         "sentiment_adjustment": adjustment,
+        "sentiment_available": adjustment is not None,
         "excluded_tracks": excluded,
     }
 
@@ -288,8 +305,30 @@ def classify_trend(f: dict) -> str:
 # --- 出貨前檢查 -------------------------------------------------------
 
 
-def sanity_check(result: dict, *, price: float, bars: int) -> dict:
-    """最後一道防線（spec 7.5）。"""
+def sanity_check(
+    result: dict, *, price: float, bars: int, annual_vol: float | None = None,
+) -> dict:
+    """最後一道防線（spec 7.5）。
+
+    **三軌方向分歧一律不可預測**（2026-09-10 修復）。原本的做法是把信心度
+    壓到 CONFLICT_CONFIDENCE_CAP，但那個常數與 MIN_CONFIDENCE_TO_SHOW 相等，
+    所以分歧的預測剛好落在顯示門檻上、照樣出貨。
+
+    語意要寫在語意的位置，不是藏在兩個常數的相對大小裡 —— 用常數的不等式
+    表達「勉強可信」正是那個 bug 的成因。方向分歧代表我們沒有觀點，
+    硬給一個合成中位數是杜撰。
+
+    **幅度必須落在該檔自身的波動區間內**（2026-09-10，spec §4.3）。分歧閘門
+    抓不到「三軌一致地喊高」：實測 ADBE 三軌方向全部向上、合成中位數
+    +39.5%、信心度 46，照樣出貨並被留存。一個月 +39.5% 對 Adobe 不是預測，
+    是假象 —— 它主張這檔會走得比自身波動度所能支撐的還遠。
+
+    `DEVIATION_ALERT`（±50%）擋不住這種：門檻是固定百分比，與個股波動度
+    無關，所以對安靜的個股太寬、對噪音大的個股太嚴。波動區間才是對的尺。
+
+    `annual_vol` 缺失時視為不通過。量不出區間就不能宣稱幅度合理 ——
+    未知不是通過，這是 spec 9.4 那條教訓的同一個形狀。
+    """
     alerts: list[str] = list(result.get("excluded_tracks") or [])
 
     if bars < MIN_BARS_TO_PREDICT:
@@ -313,15 +352,64 @@ def sanity_check(result: dict, *, price: float, bars: int) -> dict:
         for name, track in (result.get("tracks") or {}).items()
         if is_finite(track.get("fair"))
     }
-    if len(set(directions.values())) > 1:
-        alerts.append("三軌方向分歧：不同方法對後續走勢看法相反")
+    conflicted = len(set(directions.values())) > 1
+    if conflicted:
+        alerts.append(
+            "三軌方向分歧：不同方法對後續走勢看法相反，因此不提供預測值"
+        )
         result = {
             **result,
             "confidence": min(result.get("confidence", 0.0), CONFLICT_CONFIDENCE_CAP),
         }
 
-    predictable = result.get("confidence", 0.0) >= MIN_CONFIDENCE_TO_SHOW
-    if not predictable:
+    implausible = _outside_volatility_band(
+        upside=result.get("upside_pct"), annual_vol=annual_vol,
+    )
+    if implausible:
+        alerts.append(_band_alert(result.get("upside_pct"), annual_vol))
+        result = {**result, "confidence": min(result.get("confidence", 0.0), 30.0)}
+
+    predictable = (
+        not conflicted
+        and not implausible
+        and result.get("confidence", 0.0) >= MIN_CONFIDENCE_TO_SHOW
+    )
+    if not predictable and not conflicted and not implausible:
         alerts.append("信心度不足，僅呈現數據不提供預測值")
 
     return {**result, "predictable": predictable, "alerts": alerts}
+
+
+def _outside_volatility_band(*, upside, annual_vol) -> bool:
+    """中位預測是否超出該檔 HORIZON_DAYS 的波動區間。
+
+    波動度不可用時回 True（不通過）。量不出尺就不能宣稱幅度合理。
+    """
+    if not is_finite(upside):
+        return False
+    from src import risk
+
+    band = risk.volatility_band(
+        price=1.0, annual_vol=annual_vol if annual_vol is not None else float("nan"),
+        horizon_days=HORIZON_DAYS,
+    )
+    if band is None:
+        return True
+    return abs(float(upside)) > band["spread"]
+
+
+def _band_alert(upside, annual_vol) -> str:
+    from src import risk
+
+    band = risk.volatility_band(
+        price=1.0, annual_vol=annual_vol if annual_vol is not None else float("nan"),
+        horizon_days=HORIZON_DAYS,
+    )
+    if band is None:
+        return ("無法取得該檔波動度，因此無法判斷預測幅度是否合理，"
+                "不提供預測值")
+    return (
+        f"預測幅度 {float(upside):+.0%} 超出該檔 {HORIZON_DAYS} 日的波動區間"
+        f"（±{band['spread']:.0%}，依實現波動度推算），"
+        "多為資料異常而非真有此空間，不提供預測值"
+    )

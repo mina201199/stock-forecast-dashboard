@@ -116,11 +116,20 @@ def test_nan_confidence_factor_never_becomes_full_marks():
 
 
 def test_nan_sentiment_does_not_corrupt_target():
+    """NaN 情緒不得汙染目標價，且必須標示為「未計算」而非「中性」。
+
+    2026-09-10 之前這裡斷言 adjustment == 0.0。那個表示法把「沒有資料」
+    呈現成一個有意義的值（情緒中性），與本檔案要防的 NaN 陷阱同類，
+    所以改為 None + sentiment_available=False。
+    """
     out = C.blend(price=100.0, tech={"tech_q10": -0.05, "tech_q50": 0.02, "tech_q90": 0.08},
                   valuation=None, analyst=None, sentiment=float("nan"),
                   market="TW", bars=750, has_forward_eps=False)
     assert math.isfinite(out["target_mid"])
-    assert out["sentiment_adjustment"] == 0.0
+    # 目標價未被微調：中位數就是技術面分位數乘現價
+    assert out["target_mid"] == pytest.approx(102.0)
+    assert out["sentiment_adjustment"] is None
+    assert out["sentiment_available"] is False
 
 
 def test_nan_volatility_does_not_produce_a_score():
