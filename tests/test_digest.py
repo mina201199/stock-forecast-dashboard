@@ -203,12 +203,80 @@ def test_write_produces_markdown_and_parseable_json(tmp_path):
     assert md_path.exists() and json_path.exists()
     parsed = json.loads(json_path.read_text(encoding="utf-8"))
     assert parsed["as_of"] == "2026-09-10"
-    assert parsed["signals"]["edge"][0]["symbol"] == "2330.TW"
+    assert parsed["signals"]["edge"][0]["symbols"][0]["symbol"] == "2330.TW"
 
 
 def test_digest_stays_within_size_budget(tmp_path):
     """1.7 MB 的 index.html 貼不進外部工具，日報必須小。"""
     fires = [baserate.Fire(f"S{i}.TW", "TW", "a", "2026-09-10", 100.0) for i in range(120)]
     data = digest.build(_payload(fires=fires, rates=[_rate("a")]))
+    md_path, _ = digest.write(data, tmp_path)
+    assert md_path.stat().st_size < digest.SIZE_BUDGET_BYTES
+
+
+# --- 分組（2026-09-10 實跑 500 檔後補上）------------------------------
+
+
+def test_non_edge_section_prints_stats_once_per_signal_not_per_symbol():
+    """基準率掛在訊號上，不是掛在個股上 —— 逐檔重複是冗余。
+
+    實跑 500 檔時日報出現 12 行 near_high_strength，每行的勝率、
+    中位超額、有效樣本數字完全相同。181 筆觸發讓日報從 8.3 KB 漲到
+    29.6 KB，而 50 KB 上限大約在 300 筆就會撞破。
+    """
+    fires = [
+        baserate.Fire(f"S{i}.TW", "TW", "b", "2026-09-10", 100.0) for i in range(12)
+    ]
+    md = digest.render_markdown(digest.build(
+        _payload(fires=fires, rates=[_rate("b", verdict="no_edge")])))
+
+    # 勝率只能出現一次，不是 12 次
+    assert md.count("55.0%") == 1
+    # 但 12 檔標的都要列出來
+    for i in range(12):
+        assert f"S{i}.TW" in md
+
+
+def test_grouped_section_lists_every_symbol():
+    fires = [
+        baserate.Fire("2330.TW", "TW", "b", "2026-09-10", 1000.0),
+        baserate.Fire("2317.TW", "TW", "b", "2026-09-10", 200.0),
+    ]
+    md = digest.render_markdown(digest.build(
+        _payload(fires=fires, rates=[_rate("b", verdict="no_edge")])))
+    assert "2330.TW" in md and "2317.TW" in md
+
+
+def test_different_signals_stay_in_separate_groups():
+    fires = [
+        baserate.Fire("2330.TW", "TW", "b", "2026-09-10", 1000.0),
+        baserate.Fire("2317.TW", "TW", "c", "2026-09-10", 200.0),
+    ]
+    md = digest.render_markdown(digest.build(_payload(
+        fires=fires,
+        rates=[_rate("b", verdict="no_edge"),
+               _rate("c", verdict="no_edge", hit_rate=0.41)],
+    )))
+    assert "55.0%" in md and "41.0%" in md
+
+
+def test_digest_stays_within_budget_at_production_scale(tmp_path):
+    """實跑 500 檔選股池：單日 181 筆觸發、155 行波動區間，共 29.2 KB。
+
+    這裡用 3 倍的量（600 筆觸發 + 500 檔區間）當上界。未分組的版本在
+    這個規模下約 121 bytes/筆，訊號區單獨就會超過 70 KB —— 所以這個
+    測試同時是分組沒被改回去的護欄。測試的規模必須跟得上生產環境，
+    不然預算等於沒守。
+    """
+    fires = [
+        baserate.Fire(f"S{i}.TW", "TW", f"sig{i % 10}", "2026-09-10", 100.0)
+        for i in range(600)
+    ]
+    rates = [_rate(f"sig{k}", verdict="no_edge") for k in range(10)]
+    bands = [
+        {"symbol": f"S{i}.TW", "price": 100.0, "low": 90.0, "high": 110.0}
+        for i in range(500)
+    ]
+    data = digest.build(_payload(fires=fires, rates=rates, bands=bands))
     md_path, _ = digest.write(data, tmp_path)
     assert md_path.stat().st_size < digest.SIZE_BUDGET_BYTES

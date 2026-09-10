@@ -59,7 +59,14 @@ def build(payload: dict) -> dict:
         if horizon == HORIZON_FOR_HEADLINE:
             slot["headline"] = rate
 
-    buckets: dict[str, list[dict]] = {k: [] for k in VERDICT_LABELS}
+    # 按 (訊號, 市場) 分組，不是逐檔展開。
+    #
+    # 基準率掛在訊號上，不是掛在個股上 —— 同一個訊號的每一檔，勝率、
+    # 中位超額、有效樣本完全相同。實跑 500 檔選股池時日報出現 12 行
+    # near_high_strength，數字一模一樣；181 筆觸發讓訊號區佔掉 21.4 KB
+    # （約 121 bytes/筆），400 筆就會擦到 50 KB 上限。分組後統計值只印
+    # 一次，標的列成一行。
+    groups: dict[tuple[str, str], dict] = {}
     unrated: list[dict] = []
     for fire in payload.get("fires", []):
         slot = by_key.get((fire.signal_key, fire.market))
@@ -67,24 +74,34 @@ def build(payload: dict) -> dict:
         if rate is None:
             unrated.append({"symbol": fire.symbol, "signal": fire.signal_key})
             continue
-        buckets[rate.verdict].append({
-            "symbol": fire.symbol,
-            "market": fire.market,
-            "signal": fire.signal_key,
-            "price": fire.price,
-            "hit_rate": rate.hit_rate,
-            "baseline_hit_rate": rate.baseline_hit_rate,
-            "median_excess": rate.median_excess,
-            "n_effective": rate.n_effective,
-            "first_half_median": rate.first_half_median,
-            "second_half_median": rate.second_half_median,
-            "p_adjusted": rate.p_adjusted,
-            "horizons": {
-                h: {"hit_rate": r.hit_rate, "median_excess": r.median_excess,
-                    "verdict": r.verdict}
-                for h, r in sorted((slot or {}).get("horizons", {}).items())
-            },
-        })
+        ident = (fire.signal_key, fire.market)
+        group = groups.get(ident)
+        if group is None:
+            group = {
+                "signal": fire.signal_key,
+                "signal_name": _signal_name(fire.signal_key),
+                "market": fire.market,
+                "verdict": rate.verdict,
+                "hit_rate": rate.hit_rate,
+                "baseline_hit_rate": rate.baseline_hit_rate,
+                "median_excess": rate.median_excess,
+                "n_effective": rate.n_effective,
+                "first_half_median": rate.first_half_median,
+                "second_half_median": rate.second_half_median,
+                "p_adjusted": rate.p_adjusted,
+                "horizons": {
+                    h: {"hit_rate": r.hit_rate, "median_excess": r.median_excess,
+                        "verdict": r.verdict}
+                    for h, r in sorted((slot or {}).get("horizons", {}).items())
+                },
+                "symbols": [],
+            }
+            groups[ident] = group
+        group["symbols"].append({"symbol": fire.symbol, "price": fire.price})
+
+    buckets: dict[str, list[dict]] = {k: [] for k in VERDICT_LABELS}
+    for group in groups.values():
+        buckets[group["verdict"]].append(group)
 
     last_success = payload.get("last_success")
     lag = _days_between(payload.get("as_of", ""), last_success or "")
@@ -107,13 +124,27 @@ def _pct(value, digits=1) -> str:
     return f"{value:.{digits}%}" if is_finite(value) else "—"
 
 
-def _signal_line(row: dict) -> str:
-    return (
-        f"- **{row['symbol']}**（{row['signal']}）"
-        f"｜勝率 {_pct(row['hit_rate'])} vs 基準 {_pct(row['baseline_hit_rate'])}"
-        f"｜中位超額 {_pct(row['median_excess'], 2)}"
-        f"｜有效樣本 {row['n_effective']}"
+def _signal_name(key: str) -> str:
+    """訊號的顯示名稱。不在 registry 裡（測試用的假訊號）就用 key。"""
+    try:
+        from src import signals
+    except ImportError:                                       # pragma: no cover
+        return key
+    signal = signals.BY_KEY.get(key)
+    return signal.name if signal else key
+
+
+def _signal_lines(group: dict) -> list[str]:
+    """一個訊號一段：統計值一行，觸發的標的一行。"""
+    head = (
+        f"- **{group['signal_name']}**（{group['signal']}／{group['market']}）"
+        f"｜勝率 {_pct(group['hit_rate'])}"
+        f" vs 基準 {_pct(group['baseline_hit_rate'])}"
+        f"｜中位超額 {_pct(group['median_excess'], 2)}"
+        f"｜有效樣本 {group['n_effective']}"
     )
+    symbols = [entry["symbol"] for entry in group["symbols"]]
+    return [head, f"    {'、'.join(symbols)}（{len(symbols)} 檔）"]
 
 
 def render_markdown(data: dict) -> str:
@@ -145,7 +176,8 @@ def render_markdown(data: dict) -> str:
     lines.append("### 有統計優勢")
     lines.append("")
     if edges:
-        lines.extend(_signal_line(r) for r in edges)
+        for group in edges:
+            lines.extend(_signal_lines(group))
     else:
         lines.append(
             "**沒有任何訊號通過統計優勢的門檻。** 這不是「今天沒觸發」，"
@@ -166,14 +198,14 @@ def render_markdown(data: dict) -> str:
                 "多半是把一段特定行情冒充成預測力。"
             )
             lines.append("")
-        for row in rows:
-            suffix = ""
+        for group in rows:
+            body = _signal_lines(group)
             if verdict == "unstable":
-                suffix = (
-                    f"｜前半 {_pct(row['first_half_median'], 1)}"
-                    f"／後半 {_pct(row['second_half_median'], 1)}"
+                body[0] += (
+                    f"｜前半 {_pct(group['first_half_median'], 1)}"
+                    f"／後半 {_pct(group['second_half_median'], 1)}"
                 )
-            lines.append(_signal_line(row) + suffix)
+            lines.extend(body)
         lines.append("")
 
     if data.get("unrated"):
