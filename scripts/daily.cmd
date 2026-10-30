@@ -19,13 +19,16 @@ rem ---------------------------------------------------------------------------
 setlocal
 
 set "PROJ=%~dp0.."
-set "PY=C:\Users\User\anaconda3\python.exe"
+rem Python comes from PATH; set PYTHON to a full python.exe path to override.
+set "PY=python"
+if defined PYTHON set "PY=%PYTHON%"
 set "PYTHONIOENCODING=utf-8"
 set "LOGDIR=%PROJ%\logs"
 set "LOG=%LOGDIR%\daily.log"
 
-if not exist "%PY%" (
-    echo Python not found at "%PY%" 1>&2
+"%PY%" --version >nul 2>&1
+if errorlevel 1 (
+    echo Python not runnable: "%PY%" - set PYTHON to python.exe 1>&2
     exit /b 9
 )
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
